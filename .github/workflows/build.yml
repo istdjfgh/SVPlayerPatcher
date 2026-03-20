@@ -1,0 +1,53 @@
+name: Build iOS Dylib
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Build standalone dylib
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          
+          clang -arch arm64 \
+            -isysroot "$SDK" \
+            -dynamiclib \
+            -framework Foundation \
+            -framework UIKit \
+            -lobjc \
+            -o SVPlayerPatcher.dylib \
+            Tweak.m \
+            -target arm64-apple-ios15.0 \
+            -fobjc-arc \
+            -Wno-unused-function
+          
+          codesign -f -s - SVPlayerPatcher.dylib
+          
+          echo "Build complete!"
+          file SVPlayerPatcher.dylib
+          otool -L SVPlayerPatcher.dylib
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SVPlayerPatcher
+          path: SVPlayerPatcher.dylib
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: "SVPlayerPatcher v1.0.${{ github.run_number }}"
+          files: SVPlayerPatcher.dylib
+          body: "Standalone iOS dylib - no CydiaSubstrate required"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
