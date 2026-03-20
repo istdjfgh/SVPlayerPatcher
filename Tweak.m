@@ -400,7 +400,7 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v32 ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v33 API SPY ===\n\n"];
     
     // 0. Hook Security framework verify functions
     {
@@ -525,7 +525,7 @@ static void tweak_init(void) {
         });
     }
     
-    // BLOCK svp-team.com API validation by hooking NSURLSession
+    // INTERCEPT (don't block) svp-team.com API - LOG request + response
     {
         Method dm = class_getInstanceMethod([NSURLSession class], @selector(dataTaskWithRequest:completionHandler:));
         if (dm) {
@@ -533,26 +533,48 @@ static void tweak_init(void) {
             _orig_task = method_setImplementation(dm, imp_implementationWithBlock(
                 ^NSURLSessionDataTask*(id self, NSURLRequest *request, void (^completion)(NSData*, NSURLResponse*, NSError*)) {
                     NSString *url = request.URL.absoluteString;
-                    if ([url containsString:@"svp-team.com"] || [url containsString:@"svpteam.com"]) {
-                        [_log appendFormat:@"[API] BLOCKED: %@\n", url];
+                    if ([url containsString:@"svp-team"] || [url containsString:@"svpteam"]) {
+                        [_log appendFormat:@"[API] %@ %@\n", request.HTTPMethod, url];
+                        
+                        // Log request body
+                        NSData *body = request.HTTPBody;
+                        if (body) {
+                            NSString *bodyStr = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+                            if (bodyStr.length > 300) bodyStr = [bodyStr substringToIndex:300];
+                            [_log appendFormat:@"[API-BODY] %@\n", bodyStr];
+                        }
+                        
+                        // Log headers
+                        NSDictionary *headers = request.allHTTPHeaderFields;
+                        for (NSString *key in headers) {
+                            [_log appendFormat:@"[API-HDR] %@: %@\n", key, headers[key]];
+                        }
+                        
                         [UIPasteboard generalPasteboard].string = _log;
                         
-                        // Return fake "valid" response
-                        NSDictionary *resp = @{@"status": @"ok", @"valid": @YES, @"licensed": @YES};
-                        NSData *body = [NSJSONSerialization dataWithJSONObject:resp options:0 error:nil];
-                        NSHTTPURLResponse *fakeResp = [[NSHTTPURLResponse alloc]
-                            initWithURL:request.URL statusCode:200 HTTPVersion:@"HTTP/1.1"
-                            headerFields:@{@"Content-Type": @"application/json"}];
+                        // Wrap completion to log response
+                        void (^wrappedCompletion)(NSData*, NSURLResponse*, NSError*) = ^(NSData *data, NSURLResponse *resp, NSError *err) {
+                            if (err) {
+                                [_log appendFormat:@"[API-ERR] %@\n", err.localizedDescription];
+                            }
+                            if (data) {
+                                NSString *respStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                                if (!respStr) respStr = [NSString stringWithFormat:@"<binary %lu bytes>", (unsigned long)data.length];
+                                if (respStr.length > 500) respStr = [respStr substringToIndex:500];
+                                [_log appendFormat:@"[API-RESP] %@\n", respStr];
+                            }
+                            NSHTTPURLResponse *httpResp = (NSHTTPURLResponse*)resp;
+                            if ([httpResp isKindOfClass:[NSHTTPURLResponse class]]) {
+                                [_log appendFormat:@"[API-STATUS] %ld\n", (long)httpResp.statusCode];
+                            }
+                            [UIPasteboard generalPasteboard].string = _log;
+                            
+                            if (completion) completion(data, resp, err);
+                        };
                         
-                        if (completion) {
-                            dispatch_async(dispatch_get_main_queue(), ^{
-                                completion(body, fakeResp, nil);
-                            });
-                        }
-                        // Return a dummy task
-                        NSURLRequest *dummy = [NSURLRequest requestWithURL:[NSURL URLWithString:@"about:blank"]];
+                        // Let request go through with wrapped completion
                         return ((NSURLSessionDataTask*(*)(id, SEL, NSURLRequest*, id))_orig_task)(
-                            self, @selector(dataTaskWithRequest:completionHandler:), dummy, nil);
+                            self, @selector(dataTaskWithRequest:completionHandler:), request, wrappedCompletion);
                     }
                     return ((NSURLSessionDataTask*(*)(id, SEL, NSURLRequest*, id))_orig_task)(
                         self, @selector(dataTaskWithRequest:completionHandler:), request, completion);
