@@ -282,37 +282,11 @@ def patch_ipa(ipa_path):
             f.write(data)
         print(f"Patched {patched} crypto functions")
         
-        # ===== PATCH 1b: String patch "dummydummy" in libmpv =====
-        dummy_bytes = b'dummydummy'
-        replace_bytes = b'unlock0\x00\x00\x00'  # same length (10 bytes)
-        count = data.count(dummy_bytes)
-        if count > 0:
-            data2 = bytes(data).replace(dummy_bytes, replace_bytes)
-            with open(libmpv_path, 'wb') as f:
-                f.write(data2)
-            print(f"  String-patched 'dummydummy' x{count} in libmpv")
-        
-        # ===== PATCH 1c: String patch "dummydummy" in main binary =====
-        if app_dir:
-            main_bin = None
-            for item in os.listdir(app_dir):
-                full = os.path.join(app_dir, item)
-                if os.path.isfile(full) and not item.endswith('.dylib') and not item.endswith('.plist'):
-                    with open(full, 'rb') as f:
-                        magic = f.read(4)
-                    if magic in (b'\xfe\xed\xfa\xce', b'\xfe\xed\xfa\xcf', b'\xca\xfe\xba\xbe', b'\xcf\xfa\xed\xfe'):
-                        main_bin = full
-                        break
-            
-            if main_bin:
-                with open(main_bin, 'rb') as f:
-                    main_data = bytearray(f.read())
-                count2 = main_data.count(dummy_bytes)
-                if count2 > 0:
-                    main_data2 = bytes(main_data).replace(dummy_bytes, replace_bytes)
-                    with open(main_bin, 'wb') as f:
-                        f.write(main_data2)
-                    print(f"  String-patched 'dummydummy' x{count2} in {os.path.basename(main_bin)}")
+        # NOTE: Do NOT patch "dummydummy" string!
+        # "dummydummy" is the DEFAULT (not-purchased) value.
+        # Our config sets h/pid = "unlock0", which must be DIFFERENT from the default.
+        # If we replace "dummydummy" with "unlock0" in binary, then "unlock0" becomes
+        # the new default, and app treats our config as "not purchased"!
         
         # ===== PATCH 2: Remove _CodeSignature from libmpv framework =====
         # So signing tool will re-sign the modified binary
