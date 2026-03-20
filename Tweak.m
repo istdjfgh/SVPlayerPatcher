@@ -1,4 +1,4 @@
-// SVPlayerPatcher v17c - OpenSSL scan + StoreKit fake (no interpose)
+// SVPlayerPatcher v18 - Patch bundled OpenSSL PKCS7_verify
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <StoreKit/StoreKit.h>
@@ -10,28 +10,76 @@ static NSMutableString *_log = nil;
 static BOOL _fakeState = NO;
 
 // ========================================
-// PART 1: Scan for ALL crypto symbols
+// PART 1: Patch OpenSSL PKCS7_verify in app's binary
 // ========================================
-static void scanCrypto(void) {
-    const char *names[] = {
-        "PKCS7_verify", "PKCS7_sign", "PKCS7_get_signer_info",
-        "X509_verify_cert", "EVP_VerifyFinal", "EVP_DigestVerifyFinal",
-        "ECDSA_verify", "RSA_verify", "d2i_PKCS7", "i2d_PKCS7",
-        "OPENSSL_init_ssl", "SSL_library_init",
-        "BIO_new", "BIO_read", "BIO_write",
-        "ASN1_get_object", "ASN1_item_d2i",
-        "SecCMSVerify", "CMSDecoderCreate",
-        "SecTrustEvaluateWithError", "SecTrustEvaluate",
-        NULL
-    };
-    
-    [_log appendString:@"=== Crypto Symbol Scan ===\n"];
-    for (int i = 0; names[i]; i++) {
-        void *sym = dlsym(RTLD_DEFAULT, names[i]);
-        if (sym) {
-            [_log appendFormat:@"  FOUND: %s @ %p\n", names[i], sym];
-        }
+
+static void patchFunction(const char *name) {
+    void *sym = dlsym(RTLD_DEFAULT, name);
+    if (!sym) {
+        [_log appendFormat:@"[SKIP] %s not found\n", name];
+        return;
     }
+    
+    // Only patch app's OpenSSL (0x10xxxxxxx) not system (0x19xxxxxxx)
+    uintptr_t addr = (uintptr_t)sym;
+    if (addr > 0x180000000) {
+        [_log appendFormat:@"[SKIP] %s @ %p (system lib)\n", name, sym];
+        return;
+    }
+    
+    [_log appendFormat:@"[PATCH] %s @ %p (app lib)\n", name, sym];
+    
+    uint32_t *fn = (uint32_t *)sym;
+    
+    // Try multiple vm_protect strategies
+    vm_address_t page = (vm_address_t)fn & ~(vm_address_t)0x3FFF;  // 16KB page alignment
+    kern_return_t kr;
+    
+    // Strategy 1: RWX with COPY
+    kr = vm_protect(mach_task_self(), page, 0x4000, FALSE,
+                    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        // Strategy 2: RW only  
+        kr = vm_protect(mach_task_self(), page, 0x4000, FALSE,
+                        VM_PROT_READ | VM_PROT_WRITE);
+    }
+    if (kr != KERN_SUCCESS) {
+        // Strategy 3: ALL
+        kr = vm_protect(mach_task_self(), page, 0x4000, FALSE, VM_PROT_ALL);
+    }
+    
+    if (kr == KERN_SUCCESS) {
+        // ARM64: MOV W0, #1; RET
+        fn[0] = 0x52800020; // MOV W0, #1
+        fn[1] = 0xD65F03C0; // RET
+        
+        // Restore execute permission
+        vm_protect(mach_task_self(), page, 0x4000, FALSE,
+                   VM_PROT_READ | VM_PROT_EXECUTE);
+        
+        // Verify patch
+        if (fn[0] == 0x52800020 && fn[1] == 0xD65F03C0) {
+            [_log appendFormat:@"[OK] %s patched -> return 1\n", name];
+        } else {
+            [_log appendFormat:@"[WARN] %s write may have failed\n", name];
+        }
+    } else {
+        [_log appendFormat:@"[FAIL] vm_protect %s: %d\n", name, (int)kr];
+        
+        // Try mach_vm_protect
+        [_log appendFormat:@"[INFO] Page: %p, fn: %p\n", (void*)page, fn];
+    }
+}
+
+static void patchOpenSSL(void) {
+    [_log appendString:@"=== OpenSSL Patching ===\n"];
+    
+    // Patch receipt signature verification
+    patchFunction("PKCS7_verify");
+    
+    // Patch certificate chain verification (backup)
+    patchFunction("X509_verify_cert");
+    
     [_log appendString:@"\n"];
 }
 
@@ -99,9 +147,9 @@ static void patchConfig(void) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v17c ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v18 - PATCH OPENSSL ===\n\n"];
     
-    scanCrypto();
+    patchOpenSSL();
     
     Method m;
     m = class_getInstanceMethod([SKPaymentTransaction class], @selector(transactionState));
@@ -138,7 +186,7 @@ static void tweak_init(void) {
         w.layer.cornerRadius = 8; w.clipsToBounds = YES;
         w.rootViewController = [[UIViewController alloc] init];
         UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(10, 0, 360, 30)];
-        l.text = @"✅ v17c scan done - tap Buy then Cancel!";
+        l.text = @"✅ v18 OpenSSL patched - tap Restore!";
         l.textColor = [UIColor greenColor];
         l.font = [UIFont boldSystemFontOfSize:13];
         [w.rootViewController.view addSubview:l];
