@@ -266,6 +266,7 @@ def patch_ipa(ipa_path):
             'RSA_verify', 'EVP_VerifyFinal', 'EVP_DigestVerifyFinal',
             'ECDSA_verify', 'DSA_verify', 'CMS_SignerInfo_verify',
             'ASN1_item_verify', 'ASN1_verify',
+            'RSA_public_decrypt',  # License file decryption!
         ]
         patched = 0
         for sym in symbols:
@@ -284,11 +285,48 @@ def patch_ipa(ipa_path):
         
         # NOTE: Do NOT patch "dummydummy" string!
         # "dummydummy" is the DEFAULT (not-purchased) value.
-        # Our config sets h/pid = "unlock0", which must be DIFFERENT from the default.
-        # If we replace "dummydummy" with "unlock0" in binary, then "unlock0" becomes
-        # the new default, and app treats our config as "not purchased"!
+        # Our config sets h/pid = "hfr.m.y", which must be DIFFERENT from the default.
         
-        # ===== PATCH 2: Remove _CodeSignature from libmpv framework =====
+        # ===== PATCH 2: Patch SVPlayer main binary too =====
+        main_bin = None
+        if app_dir:
+            for f in os.listdir(app_dir):
+                fpath = os.path.join(app_dir, f)
+                if os.path.isfile(fpath) and not f.startswith('.') and '.' not in f:
+                    # Check if it's a Mach-O
+                    with open(fpath, 'rb') as bf:
+                        magic = bf.read(4)
+                        if magic in (b'\xCF\xFA\xED\xFE', b'\xCA\xFE\xBA\xBE'):
+                            main_bin = fpath
+                            break
+        
+        if main_bin:
+            print(f"\n=== Patching main binary: {os.path.basename(main_bin)} ===")
+            with open(main_bin, 'rb') as f:
+                main_data = bytearray(f.read())
+            
+            main_symbols = [
+                'PKCS7_verify', 'X509_verify_cert', 'CMS_verify', 'CMS_verify_receipt',
+                'RSA_verify', 'EVP_VerifyFinal', 'EVP_DigestVerifyFinal',
+                'ECDSA_verify', 'DSA_verify', 'RSA_public_decrypt',
+            ]
+            main_patched = 0
+            for sym in main_symbols:
+                offset = find_symbol_offset(main_data, sym)
+                if offset is not None:
+                    print(f"  PATCH {sym} @ 0x{offset:X}")
+                    main_data[offset:offset+4] = MOV_W0_1
+                    main_data[offset+4:offset+8] = RET
+                    main_patched += 1
+                else:
+                    print(f"  skip {sym} (not in main binary)")
+            
+            if main_patched > 0:
+                with open(main_bin, 'wb') as f:
+                    f.write(main_data)
+                print(f"Patched {main_patched} functions in main binary")
+        
+        # ===== PATCH 3: Remove _CodeSignature =====
         # So signing tool will re-sign the modified binary
         libmpv_framework = os.path.dirname(libmpv_path)
         codesig_dir = os.path.join(libmpv_framework, "_CodeSignature")
