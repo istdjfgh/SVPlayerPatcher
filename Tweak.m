@@ -256,66 +256,71 @@ static void testReceiptParsing(NSData *receipt) {
 }
 
 static void dumpMainCfg(void) {
-    [_log appendString:@"=== main.cfg ===\n"];
+    [_log appendString:@"=== File Search (recursive) ===\n"];
     
-    NSString *dataDir = NSHomeDirectory();
     NSFileManager *fm = [NSFileManager defaultManager];
     
-    // Search for main.cfg
-    NSArray *searchPaths = @[
-        [dataDir stringByAppendingPathComponent:@"Library/Preferences"],
-        [dataDir stringByAppendingPathComponent:@"Library"],
-        [dataDir stringByAppendingPathComponent:@"Documents"],
-        dataDir,
+    // Search these root directories
+    NSArray *roots = @[
+        NSHomeDirectory(),
+        [[NSBundle mainBundle] bundlePath],
     ];
     
-    for (NSString *dir in searchPaths) {
-        NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil];
-        for (NSString *item in items) {
-            if ([item containsString:@"main.cfg"] || [item containsString:@"svp.lic"] ||
-                [item containsString:@"com.svpteam"]) {
-                NSString *full = [dir stringByAppendingPathComponent:item];
-                [_log appendFormat:@"  Found: %@/%@\n", [dir lastPathComponent], item];
-                
-                // Read small files
+    for (NSString *root in roots) {
+        NSDirectoryEnumerator *en = [fm enumeratorAtPath:root];
+        NSString *item;
+        int found = 0;
+        while ((item = [en nextObject]) && found < 50) {
+            NSString *lower = [item lowercaseString];
+            BOOL interesting = [lower hasSuffix:@".cfg"] || [lower hasSuffix:@".lic"] ||
+                               [lower hasSuffix:@".ini"] ||
+                               [lower containsString:@"svp"] || [lower containsString:@"main.cfg"] ||
+                               [lower containsString:@"purchase"] || [lower containsString:@"license"];
+            
+            if (!interesting) continue;
+            
+            NSString *full = [root stringByAppendingPathComponent:item];
+            NSDictionary *attrs = [fm attributesOfItemAtPath:full error:nil];
+            NSNumber *size = attrs[NSFileSize];
+            
+            [_log appendFormat:@"  %@ (%@ bytes)\n", item, size];
+            
+            // Read small text files
+            if (size.unsignedLongLongValue < 3000 && size.unsignedLongLongValue > 0) {
                 NSData *d = [NSData dataWithContentsOfFile:full];
-                if (d && d.length < 2000) {
-                    NSString *content = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-                    if (content) {
-                        [_log appendFormat:@"  Content:\n%@\n", content];
+                if (d) {
+                    NSString *c = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+                    if (c && c.length > 0) {
+                        // Show first 500 chars
+                        if (c.length > 500) c = [c substringToIndex:500];
+                        [_log appendFormat:@"    ---\n%@\n    ---\n", c];
+                    } else {
+                        // Binary file, show hex
+                        [_log appendString:@"    [binary] "];
+                        const uint8_t *b = d.bytes;
+                        for (int i = 0; i < 40 && i < (int)d.length; i++) {
+                            [_log appendFormat:@"%02X", b[i]];
+                        }
+                        [_log appendString:@"...\n"];
                     }
                 }
             }
+            found++;
         }
+        [_log appendFormat:@"  (%@ total interesting files)\n\n", @(found)];
     }
     
-    // Also check bundle for config files
-    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
-    NSArray *bundleItems = [fm contentsOfDirectoryAtPath:bundlePath error:nil];
-    for (NSString *item in bundleItems) {
-        if ([item hasSuffix:@".cfg"] || [item hasSuffix:@".lic"] || [item hasSuffix:@".ini"]) {
-            [_log appendFormat:@"  Bundle: %@\n", item];
-            NSString *full = [bundlePath stringByAppendingPathComponent:item];
-            NSData *d = [NSData dataWithContentsOfFile:full];
-            if (d && d.length < 2000) {
-                NSString *c = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-                if (c) [_log appendFormat:@"%@\n", c];
-            }
-        }
-    }
-    
-    // Check NSUserDefaults for purchase-related keys
+    // Also check NSUserDefaults - ALL keys (not filtered)
     NSDictionary *defaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
-    [_log appendString:@"\n=== UserDefaults (purchase keys) ===\n"];
-    for (NSString *key in defaults) {
-        NSString *lk = [key lowercaseString];
-        if ([lk containsString:@"purchase"] || [lk containsString:@"premium"] ||
-            [lk containsString:@"trial"] || [lk containsString:@"license"] ||
-            [lk containsString:@"unlock"] || [lk containsString:@"paid"] ||
-            [lk containsString:@"pro"] || [lk containsString:@"hfr"] ||
-            [lk containsString:@"h/pid"] || [lk containsString:@"h/uid"]) {
-            [_log appendFormat:@"  %@ = %@\n", key, defaults[key]];
-        }
+    [_log appendFormat:@"=== UserDefaults (%lu keys) ===\n", (unsigned long)defaults.count];
+    for (NSString *key in [defaults.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+        // Skip Apple internal keys
+        if ([key hasPrefix:@"NS"] || [key hasPrefix:@"Apple"] || [key hasPrefix:@"AK"] ||
+            [key hasPrefix:@"com.apple"] || [key hasPrefix:@"INNext"] || [key hasPrefix:@"PK"]) continue;
+        id val = defaults[key];
+        NSString *vs = [NSString stringWithFormat:@"%@", val];
+        if (vs.length > 100) vs = [vs substringToIndex:100];
+        [_log appendFormat:@"  %@ = %@\n", key, vs];
     }
     [_log appendString:@"\n"];
 }
