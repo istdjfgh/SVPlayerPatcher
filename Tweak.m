@@ -1,97 +1,113 @@
-// SVPlayerPatcher v14 - Block receipt reading + fake transaction
+// SVPlayerPatcher v15 - Memory scan of C++ backend object
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <StoreKit/StoreKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
+static UIWindow *_overlayWindow = nil;
 static NSMutableString *_log = nil;
-static BOOL _fakeState = NO;
-static BOOL _blockReceipt = NO;
+static void *_backendPtr = NULL;
 
-// === Fake transactionState ===
-static IMP _orig_txState = NULL;
-static NSInteger hooked_txState(id self, SEL _cmd) {
-    if (_fakeState) return SKPaymentTransactionStateRestored;
-    return ((NSInteger(*)(id, SEL))_orig_txState)(self, _cmd);
-}
-static IMP _orig_txId = NULL;
-static NSString* hooked_txId(id self, SEL _cmd) {
-    if (_fakeState) return @"2000000845671234";
-    return ((NSString*(*)(id, SEL))_orig_txId)(self, _cmd);
-}
-static IMP _orig_txDate = NULL;
-static NSDate* hooked_txDate(id self, SEL _cmd) {
-    if (_fakeState) return [NSDate date];
-    return ((NSDate*(*)(id, SEL))_orig_txDate)(self, _cmd);
-}
-static IMP _orig_origTx = NULL;
-static id hooked_origTx(id self, SEL _cmd) {
-    if (_fakeState) return self;
-    return ((id(*)(id, SEL))_orig_origTx)(self, _cmd);
-}
+// === Capture InAppPurchaseManager and its backend pointer ===
+static IMP _orig_addObserver = NULL;
 
-// === Hook updatedTransactions ===
-static IMP _orig_updated = NULL;
-static void hooked_updated(id self, SEL _cmd, id queue, NSArray *txs) {
-    for (SKPaymentTransaction *tx in txs) {
-        NSInteger real = ((NSInteger(*)(id, SEL))_orig_txState)(tx, @selector(transactionState));
-        [_log appendFormat:@"[TX] real=%ld prod=%@\n", (long)real, tx.payment.productIdentifier];
+static void hooked_addObserver(id self, SEL _cmd, id observer) {
+    NSString *cn = NSStringFromClass([observer class]);
+    [_log appendFormat:@"[OBS] %@\n", cn];
+    
+    if ([cn isEqualToString:@"InAppPurchaseManager"]) {
+        // Get `backend` ivar (^v = void pointer)
+        Ivar backendIvar = class_getInstanceVariable([observer class], "backend");
+        if (backendIvar) {
+            ptrdiff_t offset = ivar_getOffset(backendIvar);
+            char *base = (char *)(__bridge void *)observer;
+            _backendPtr = *(void **)(base + offset);
+            [_log appendFormat:@"[OK] backend ptr = %p (offset=%ld)\n", _backendPtr, (long)offset];
+            
+            // Dump memory at backend pointer (256 bytes)
+            if (_backendPtr) {
+                [_log appendString:@"\n=== Backend Memory Dump (256 bytes) ===\n"];
+                unsigned char *mem = (unsigned char *)_backendPtr;
+                for (int row = 0; row < 32; row++) {
+                    int off = row * 8;
+                    [_log appendFormat:@"+%03d: ", off];
+                    
+                    // Hex
+                    for (int col = 0; col < 8; col++) {
+                        [_log appendFormat:@"%02X ", mem[off + col]];
+                    }
+                    
+                    // Values as different types
+                    // Check for bool-like values (0 or 1)
+                    [_log appendString:@" | "];
+                    for (int col = 0; col < 8; col++) {
+                        unsigned char b = mem[off + col];
+                        if (b == 0) [_log appendString:@"0"];
+                        else if (b == 1) [_log appendString:@"1"];
+                        else [_log appendString:@"."];
+                    }
+                    
+                    [_log appendString:@"\n"];
+                }
+                
+                // Also dump as int64 values
+                [_log appendString:@"\n=== As int64 values ===\n"];
+                long long *lmem = (long long *)_backendPtr;
+                for (int i = 0; i < 32; i++) {
+                    if (lmem[i] != 0) {
+                        [_log appendFormat:@"+%d: %lld (0x%llx)\n", i*8, lmem[i], lmem[i]];
+                    }
+                }
+            }
+        } else {
+            [_log appendString:@"[FAIL] No backend ivar\n"];
+        }
+        
+        // Also get pendingTransactions
+        Ivar ptIvar = class_getInstanceVariable([observer class], "pendingTransactions");
+        if (ptIvar) {
+            id pt = object_getIvar(observer, ptIvar);
+            [_log appendFormat:@"[INFO] pendingTransactions = %@\n", pt];
+        }
     }
     
-    // Enable fake state + block receipt during original processing
-    _fakeState = YES;
-    _blockReceipt = YES;
-    [_log appendString:@"[PATCH] Faking state=Restored + blocking receipt\n"];
+    ((void(*)(id, SEL, id))_orig_addObserver)(self, _cmd, observer);
+}
+
+// === Minimal tx hooks ===
+static IMP _orig_txState = NULL;
+static IMP _orig_updated = NULL;
+
+static void hooked_updated(id self, SEL _cmd, id queue, NSArray *txs) {
+    for (SKPaymentTransaction *tx in txs) {
+        [_log appendFormat:@"[TX] state=%ld prod=%@\n", (long)tx.transactionState, tx.payment.productIdentifier];
+    }
     ((void(*)(id, SEL, id, NSArray*))_orig_updated)(self, _cmd, queue, txs);
-    _fakeState = NO;
-    _blockReceipt = NO;
-    [_log appendString:@"[PATCH] Done\n"];
+    
+    // Re-dump backend memory after transaction processing
+    if (_backendPtr) {
+        [_log appendString:@"\n=== Backend AFTER tx ===\n"];
+        unsigned char *mem = (unsigned char *)_backendPtr;
+        for (int row = 0; row < 32; row++) {
+            int off = row * 8;
+            [_log appendFormat:@"+%03d: ", off];
+            for (int col = 0; col < 8; col++) {
+                [_log appendFormat:@"%02X ", mem[off + col]];
+            }
+            [_log appendString:@" | "];
+            for (int col = 0; col < 8; col++) {
+                unsigned char b = mem[off + col];
+                if (b == 0) [_log appendString:@"0"];
+                else if (b == 1) [_log appendString:@"1"];
+                else [_log appendString:@"."];
+            }
+            [_log appendString:@"\n"];
+        }
+    }
     [UIPasteboard generalPasteboard].string = _log;
 }
 
-// === Block receipt reads when _blockReceipt is true ===
-static IMP _orig_dataURL = NULL;
-static id hooked_dataURL(id self, SEL _cmd, NSURL *url) {
-    if (_blockReceipt && [url.path containsString:@"Receipt"]) {
-        [_log appendString:@"[BLOCK] receipt read via URL -> nil\n"];
-        return nil;
-    }
-    return ((id(*)(id, SEL, NSURL*))_orig_dataURL)(self, _cmd, url);
-}
-
-static IMP _orig_dataFile = NULL;
-static id hooked_dataFile(id self, SEL _cmd, NSString *path) {
-    if (_blockReceipt && [path containsString:@"Receipt"]) {
-        [_log appendString:@"[BLOCK] receipt read via file -> nil\n"];
-        return nil;
-    }
-    return ((id(*)(id, SEL, NSString*))_orig_dataFile)(self, _cmd, path);
-}
-
-static IMP _orig_classDataFile = NULL;
-static id hooked_classDataFile(id self, SEL _cmd, NSString *path) {
-    if (_blockReceipt && [path containsString:@"Receipt"]) {
-        [_log appendString:@"[BLOCK] receipt class read -> nil\n"];
-        return nil;
-    }
-    return ((id(*)(id, SEL, NSString*))_orig_classDataFile)(self, _cmd, path);
-}
-
-// === Also hook appStoreReceiptURL to return nil path ===
-static IMP _orig_receiptURL = NULL;
-static NSURL* hooked_receiptURL(id self, SEL _cmd) {
-    if (_blockReceipt) {
-        [_log appendString:@"[BLOCK] receiptURL -> nil\n"];
-        return nil;
-    }
-    return ((NSURL*(*)(id, SEL))_orig_receiptURL)(self, _cmd);
-}
-
-static IMP _orig_finish = NULL;
-static void hooked_finish(id s, SEL c, id tx) {
-    @try { ((void(*)(id,SEL,id))_orig_finish)(s,c,tx); } @catch(NSException *e) {}
-}
 static IMP _orig_restored = NULL;
 static void hooked_restored(id s, SEL c, id q) {
     [_log appendString:@"[RESTORE] Done\n"];
@@ -111,71 +127,74 @@ static void patchConfig(void) {
     c[@"h/last_check"] = @(1893456000);
     NSData *n = [NSJSONSerialization dataWithJSONObject:c options:NSJSONWritingPrettyPrinted error:nil];
     [n writeToFile:p atomically:YES];
-    [_log appendString:@"[OK] cfg patched\n"];
+    [_log appendString:@"[OK] cfg\n"];
 }
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v14 ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v15 ===\n\n"];
     Method m;
     
-    // StoreKit
-    m = class_getInstanceMethod([SKPaymentTransaction class], @selector(transactionState));
-    if (m) _orig_txState = method_setImplementation(m, (IMP)hooked_txState);
-    m = class_getInstanceMethod([SKPaymentTransaction class], @selector(transactionIdentifier));
-    if (m) _orig_txId = method_setImplementation(m, (IMP)hooked_txId);
-    m = class_getInstanceMethod([SKPaymentTransaction class], @selector(transactionDate));
-    if (m) _orig_txDate = method_setImplementation(m, (IMP)hooked_txDate);
-    m = class_getInstanceMethod([SKPaymentTransaction class], @selector(originalTransaction));
-    if (m) _orig_origTx = method_setImplementation(m, (IMP)hooked_origTx);
-    m = class_getInstanceMethod([SKPaymentQueue class], @selector(finishTransaction:));
-    if (m) _orig_finish = method_setImplementation(m, (IMP)hooked_finish);
-    [_log appendString:@"[OK] SK\n"];
-    
-    // Receipt blocking
-    m = class_getInstanceMethod([NSData class], @selector(initWithContentsOfURL:));
-    if (m) _orig_dataURL = method_setImplementation(m, (IMP)hooked_dataURL);
-    m = class_getInstanceMethod([NSData class], @selector(initWithContentsOfFile:));
-    if (m) _orig_dataFile = method_setImplementation(m, (IMP)hooked_dataFile);
-    Method cm = class_getClassMethod([NSData class], @selector(dataWithContentsOfFile:));
-    if (cm) _orig_classDataFile = method_setImplementation(cm, (IMP)hooked_classDataFile);
-    m = class_getInstanceMethod([NSBundle class], @selector(appStoreReceiptURL));
-    if (m) _orig_receiptURL = method_setImplementation(m, (IMP)hooked_receiptURL);
-    [_log appendString:@"[OK] Receipt block\n"];
+    m = class_getInstanceMethod([SKPaymentQueue class], @selector(addTransactionObserver:));
+    if (m) _orig_addObserver = method_setImplementation(m, (IMP)hooked_addObserver);
+    [_log appendString:@"[OK] Hooks\n"];
     
     patchConfig();
     
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         Class cls = NSClassFromString(@"InAppPurchaseManager");
         if (!cls) return;
-        Method m2 = class_getInstanceMethod(cls, @selector(paymentQueue:updatedTransactions:));
-        if (m2) _orig_updated = method_setImplementation(m2, (IMP)hooked_updated);
-        Method m4 = class_getInstanceMethod(cls, @selector(paymentQueueRestoreCompletedTransactionsFinished:));
-        if (m4) _orig_restored = method_setImplementation(m4, (IMP)hooked_restored);
+        
+        m = class_getInstanceMethod(cls, @selector(paymentQueue:updatedTransactions:));
+        if (m) _orig_updated = method_setImplementation(m, (IMP)hooked_updated);
+        m = class_getInstanceMethod(cls, @selector(paymentQueueRestoreCompletedTransactionsFinished:));
+        if (m) _orig_restored = method_setImplementation(m, (IMP)hooked_restored);
         [_log appendString:@"[OK] IAP\n"];
+        
         [UIPasteboard generalPasteboard].string = _log;
         
+        // Show full dump overlay
         UIWindowScene *sc = nil;
         for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) { sc = s; break; }
         if (!sc) return;
-        UIWindow *w = [[UIWindow alloc] initWithWindowScene:sc];
-        w.frame = CGRectMake(20, 40, 300, 30);
-        w.windowLevel = UIWindowLevelAlert + 100;
-        w.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.8];
-        w.layer.cornerRadius = 8; w.clipsToBounds = YES;
-        w.rootViewController = [[UIViewController alloc] init];
-        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(10, 0, 280, 30)];
-        l.text = @"✅ v14 - tap Buy/Restore!";
-        l.textColor = [UIColor greenColor];
-        l.font = [UIFont boldSystemFontOfSize:13];
-        [w.rootViewController.view addSubview:l];
-        w.hidden = NO;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3*NSEC_PER_SEC), dispatch_get_main_queue(), ^{ w.hidden = YES; });
         
-        for (int i = 1; i <= 30; i++) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i*2.0*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        _overlayWindow = [[UIWindow alloc] initWithWindowScene:sc];
+        _overlayWindow.frame = sc.coordinateSpace.bounds;
+        _overlayWindow.windowLevel = UIWindowLevelAlert + 100;
+        _overlayWindow.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.92];
+        _overlayWindow.rootViewController = [[UIViewController alloc] init];
+        CGRect b = _overlayWindow.bounds;
+        
+        UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(20, 50, b.size.width - 40, 30)];
+        t.text = @"v15 MEMORY DUMP - copy log from clipboard";
+        t.textColor = [UIColor cyanColor];
+        t.font = [UIFont boldSystemFontOfSize:13];
+        [_overlayWindow.rootViewController.view addSubview:t];
+        
+        UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(10, 85, b.size.width - 20, b.size.height - 95)];
+        tv.text = _log;
+        tv.font = [UIFont fontWithName:@"Menlo" size:9];
+        tv.textColor = [UIColor greenColor];
+        tv.backgroundColor = [UIColor clearColor];
+        tv.editable = NO;
+        tv.tag = 999;
+        [_overlayWindow.rootViewController.view addSubview:tv];
+        
+        _overlayWindow.hidden = NO;
+        [_overlayWindow makeKeyAndVisible];
+        
+        for (int i = 1; i <= 20; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                UITextView *lv = (UITextView*)[_overlayWindow.rootViewController.view viewWithTag:999];
+                if (lv) lv.text = _log;
                 [UIPasteboard generalPasteboard].string = _log;
             });
         }
+        
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [UIPasteboard generalPasteboard].string = _log;
+            _overlayWindow.hidden = YES;
+            _overlayWindow = nil;
+        });
     });
 }
