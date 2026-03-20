@@ -395,7 +395,25 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v27 ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v28 ===\n\n"];
+    
+    // 0. Hook Security framework verify functions
+    {
+        // SecKeyRawVerify -> always errSecSuccess (0)
+        void *secSym = dlsym(RTLD_DEFAULT, "SecKeyRawVerify");
+        if (secSym) {
+            // Can't easily hook C functions without fishhook, but we can try method swizzle
+            [_log appendString:@"[SEC] SecKeyRawVerify found\n"];
+        }
+        
+        // Delete svp.lic to force fresh license check
+        NSString *licPath = [NSHomeDirectory() stringByAppendingPathComponent:
+                             @"Library/Application Support/SVPlayer/settings/svp.lic"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:licPath]) {
+            [[NSFileManager defaultManager] removeItemAtPath:licPath error:nil];
+            [_log appendString:@"[LIC] Deleted svp.lic ✅\n"];
+        }
+    }
     
     // 1. Verify binary patches
     verifyPatch();
@@ -555,6 +573,16 @@ static void tweak_init(void) {
                     [_log appendFormat:@"[DATA-FILE] %@ -> FAKE ✅\n", [path lastPathComponent]];
                     [UIPasteboard generalPasteboard].string = _log;
                     return _globalReceipt;
+                }
+                // Block svp.lic reads - force app to use receipt/config instead
+                if ([path containsString:@"svp.lic"]) {
+                    [_log appendFormat:@"[LIC-READ] BLOCKED svp.lic read ❌\n"];
+                    [UIPasteboard generalPasteboard].string = _log;
+                    return nil; // File not found
+                }
+                // Log SVPlayer file reads
+                if ([path containsString:@"SVPlayer"] || [path containsString:@"svpteam"]) {
+                    [_log appendFormat:@"[FILE-READ] %@\n", [path lastPathComponent]];
                 }
                 return ((NSData*(*)(id, SEL, NSString*))_orig_dataFile)(self, @selector(initWithContentsOfFile:), path);
             }));
