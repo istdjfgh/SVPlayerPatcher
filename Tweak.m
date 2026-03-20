@@ -395,7 +395,7 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v25 CONFIG PATCH ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v27 ===\n\n"];
     
     // 1. Verify binary patches
     verifyPatch();
@@ -457,26 +457,18 @@ static void tweak_init(void) {
     
     patchConfig(); // Patch NOW (before Qt init)
     
-    // Make main.cfg READ-ONLY so Qt can't reset h/pid!
-    NSDictionary *roAttrs = @{NSFilePosixPermissions: @(0444)};
-    [[NSFileManager defaultManager] setAttributes:roAttrs ofItemAtPath:cfgPath error:nil];
-    [_log appendString:@"[CFG] Set read-only (0444) 🔒\n"];
-    
-    // Also keep checking - if Qt somehow writes, re-patch and re-lock
-    for (int i = 1; i <= 30; i++) {
+    // DON'T make read-only! Qt needs to READ the file.
+    // Instead keep re-patching if Qt overwrites with dummydummy
+    for (int i = 1; i <= 60; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 500 * NSEC_PER_MSEC)), dispatch_get_global_queue(0, 0), ^{
             NSData *d = [NSData dataWithContentsOfFile:cfgPath];
             if (d) {
                 NSString *c = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
                 if (c && [c containsString:@"dummydummy"]) {
-                    // Make writable first, then patch, then lock again
-                    [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @(0644)}
-                                                     ofItemAtPath:cfgPath error:nil];
                     NSString *p = [c stringByReplacingOccurrencesOfString:@"\"dummydummy\""
                                                               withString:@"\"unlock0\""];
                     [p writeToFile:cfgPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-                    [[NSFileManager defaultManager] setAttributes:roAttrs ofItemAtPath:cfgPath error:nil];
-                    [_log appendFormat:@"[CFG] Re-patched+locked at %dms ✅\n", i*500];
+                    [_log appendFormat:@"[CFG] Re-patched at %dms ✅\n", i*500];
                 }
             }
         });
@@ -590,6 +582,18 @@ static void tweak_init(void) {
             Method my = class_getInstanceMethod(cls, @selector(paymentQueueRestoreCompletedTransactionsFinished:));
             if (my) _orig_restored = method_setImplementation(my, (IMP)hooked_restored);
             [_log appendString:@"[OK] IAP hooks\n"];
+        }
+        [UIPasteboard generalPasteboard].string = _log;
+    });
+    
+    // 5b. Read main.cfg AFTER Qt loaded it (5s)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NSData *cfgData = [NSData dataWithContentsOfFile:cfgPath];
+        if (cfgData) {
+            NSString *cfgContent = [[NSString alloc] initWithData:cfgData encoding:NSUTF8StringEncoding];
+            [_log appendFormat:@"\n=== main.cfg AFTER Qt (5s) ===\n%@\n", cfgContent ?: @"<binary>"];
+        } else {
+            [_log appendString:@"\n=== main.cfg AFTER Qt: NOT FOUND ===\n"];
         }
         [UIPasteboard generalPasteboard].string = _log;
     });
