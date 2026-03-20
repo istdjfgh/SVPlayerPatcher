@@ -618,20 +618,79 @@ static void tweak_init(void) {
             unsigned long long sz = [a[NSFileSize] unsignedLongLongValue];
             [_log appendFormat:@"  %@ (%llu)\n", item, sz];
             
-            // Read cfg/lic/ini/plist files
+            // Read cfg/lic/ini/plist/LOG files
             NSString *lower = [item lowercaseString];
             if (([lower hasSuffix:@".cfg"] || [lower hasSuffix:@".lic"] || [lower hasSuffix:@".ini"] ||
-                 [lower hasSuffix:@".plist"]) && sz < 3000 && sz > 0) {
+                 [lower hasSuffix:@".plist"] || [lower hasSuffix:@".log"]) && sz < 5000 && sz > 0) {
                 NSData *d = [NSData dataWithContentsOfFile:full];
                 NSString *c = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
                 if (c) {
-                    if (c.length > 300) c = [c substringToIndex:300];
+                    if (c.length > 500) c = [c substringToIndex:500];
                     [_log appendFormat:@"    ---\n%@\n    ---\n", c];
                 }
             }
             total++;
         }
         [_log appendFormat:@"  (listed %d files)\n", total];
+        
+        // === RUNTIME LICENSE SCAN ===
+        [_log appendString:@"\n=== ObjC Runtime Scan ===\n"];
+        
+        // Scan InAppPurchaseManager
+        Class iapCls = NSClassFromString(@"InAppPurchaseManager");
+        if (iapCls) {
+            [_log appendString:@"InAppPurchaseManager:\n"];
+            unsigned int mc = 0;
+            Method *methods = class_copyMethodList(iapCls, &mc);
+            for (unsigned int i = 0; i < mc && i < 30; i++) {
+                [_log appendFormat:@"  M: %s\n", sel_getName(method_getName(methods[i]))];
+            }
+            free(methods);
+            
+            unsigned int ic = 0;
+            Ivar *ivars = class_copyIvarList(iapCls, &ic);
+            for (unsigned int i = 0; i < ic; i++) {
+                [_log appendFormat:@"  I: %s (%s)\n", ivar_getName(ivars[i]), ivar_getTypeEncoding(ivars[i])];
+            }
+            free(ivars);
+            
+            unsigned int pc = 0;
+            objc_property_t *props = class_copyPropertyList(iapCls, &pc);
+            for (unsigned int i = 0; i < pc; i++) {
+                [_log appendFormat:@"  P: %s = %s\n", property_getName(props[i]),
+                 property_getAttributes(props[i])];
+            }
+            free(props);
+        }
+        
+        // Search ALL classes for license-related properties
+        [_log appendString:@"\n=== License Properties ===\n"];
+        unsigned int classCount = 0;
+        Class *classes = objc_copyClassList(&classCount);
+        for (unsigned int i = 0; i < classCount; i++) {
+            const char *name = class_getName(classes[i]);
+            NSString *cn = [NSString stringWithUTF8String:name];
+            // Only check app classes
+            if (![cn hasPrefix:@"SVP"] && ![cn hasPrefix:@"InApp"] && ![cn containsString:@"SVPlayer"] &&
+                ![cn containsString:@"License"] && ![cn containsString:@"Purchase"] &&
+                ![cn containsString:@"Backend"]) continue;
+            
+            [_log appendFormat:@"  CLASS: %@\n", cn];
+            unsigned int pc = 0;
+            objc_property_t *props = class_copyPropertyList(classes[i], &pc);
+            for (unsigned int j = 0; j < pc && j < 20; j++) {
+                [_log appendFormat:@"    P: %s\n", property_getName(props[j])];
+            }
+            free(props);
+            
+            unsigned int mc2 = 0;
+            Method *methods2 = class_copyMethodList(classes[i], &mc2);
+            for (unsigned int j = 0; j < mc2 && j < 20; j++) {
+                [_log appendFormat:@"    M: %s\n", sel_getName(method_getName(methods2[j]))];
+            }
+            free(methods2);
+        }
+        free(classes);
         
         [UIPasteboard generalPasteboard].string = _log;
         
