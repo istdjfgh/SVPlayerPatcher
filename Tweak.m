@@ -1,45 +1,13 @@
-// SVPlayerPatcher v30 - DYLD interpose + fake receipt + fake TX
+// SVPlayerPatcher v32 - fake TX + no DYLD interpose
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <StoreKit/StoreKit.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
-#import <stdio.h>
 
 static NSMutableString *_log = nil;
 static BOOL _fakeState = NO;
-
-// ====================================================
-// DYLD INTERPOSE: Hook C-level fopen to block svp.lic
-// ====================================================
-#define DYLD_INTERPOSE(_replacement, _original) \
-    __attribute__((used)) static struct { const void *replacement; const void *original; } \
-    _interpose_##_original __attribute__((section("__DATA,__interpose"))) = \
-    { (const void *)(_replacement), (const void *)(_original) };
-
-// Original fopen pointer (resolved at load time)
-static FILE *(*orig_fopen)(const char *, const char *) = NULL;
-
-__attribute__((constructor(101)))
-static void resolve_orig_fopen(void) {
-    orig_fopen = (FILE *(*)(const char *, const char *))dlsym(RTLD_NEXT, "fopen");
-    if (!orig_fopen) orig_fopen = fopen; // fallback
-}
-
-FILE *my_fopen(const char *path, const char *mode) {
-    if (path && strstr(path, "svp.lic")) {
-        // Block svp.lic reads - prevents license validation → no h/pid reset
-        if (_log) {
-            [_log appendFormat:@"[FOPEN] BLOCKED svp.lic ❌\n"];
-        }
-        return NULL;
-    }
-    if (path && _log && strstr(path, "main.cfg")) {
-        [_log appendFormat:@"[FOPEN] main.cfg mode=%s\n", mode];
-    }
-    return orig_fopen(path, mode);
-}
-DYLD_INTERPOSE(my_fopen, fopen);
+static NSData *_globalReceipt = nil;
 
 // ====================================================
 // PART 1: Verify binary patch + scan crypto
@@ -244,6 +212,10 @@ static void writeFakeReceipt(void) {
     if (!_receiptPath) {
         [_log appendString:@"  ALL WRITES FAILED!\n"];
     }
+    
+    // Store globally for FakeTransaction
+    _globalReceipt = receipt;
+    
     [_log appendString:@"\n"];
 }
 
@@ -428,7 +400,7 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v31 FOPEN ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v32 ===\n\n"];
     
     // 0. Hook Security framework verify functions
     {
