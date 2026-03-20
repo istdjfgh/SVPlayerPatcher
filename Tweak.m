@@ -178,30 +178,34 @@ static void writeFakeReceipt(void) {
     NSData *receipt = buildFakeReceipt(bundleId);
     [_log appendFormat:@"  Receipt size: %lu bytes\n", (unsigned long)receipt.length];
     
-    // Write to where iOS stores receipts
-    NSString *receiptPath = [[[NSBundle mainBundle] appStoreReceiptURL] path];
-    [_log appendFormat:@"  Receipt URL: %@\n", receiptPath ?: @"nil"];
-    
-    if (receiptPath) {
-        NSString *dir = [receiptPath stringByDeletingLastPathComponent];
-        [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                                  withIntermediateDirectories:YES attributes:nil error:nil];
-        BOOL ok = [receipt writeToFile:receiptPath atomically:YES];
-        [_log appendFormat:@"  Write to receiptURL: %@\n", ok ? @"OK ✅" : @"FAIL ❌"];
-    }
-    
-    // Also write to common receipt locations
+    // Write to WRITABLE locations (StoreKit dir is protected by iOS)
     NSString *dataDir = NSHomeDirectory();
-    NSArray *paths = @[
-        [dataDir stringByAppendingPathComponent:@"StoreKit/sandboxReceipt"],
-        [dataDir stringByAppendingPathComponent:@"StoreKit/receipt"],
+    static NSString *_receiptPath = nil;
+    NSError *err = nil;
+    
+    NSArray *tryPaths = @[
+        [dataDir stringByAppendingPathComponent:@"Library/Caches/fakereceipt"],
+        [dataDir stringByAppendingPathComponent:@"Library/fakereceipt"],
+        [dataDir stringByAppendingPathComponent:@"Documents/fakereceipt"],
+        [dataDir stringByAppendingPathComponent:@"tmp/fakereceipt"],
     ];
-    for (NSString *p in paths) {
+    
+    for (NSString *p in tryPaths) {
         NSString *dir = [p stringByDeletingLastPathComponent];
         [[NSFileManager defaultManager] createDirectoryAtPath:dir
                                   withIntermediateDirectories:YES attributes:nil error:nil];
-        BOOL ok = [receipt writeToFile:p atomically:YES];
-        [_log appendFormat:@"  %@: %@\n", [p lastPathComponent], ok ? @"OK ✅" : @"FAIL ❌"];
+        BOOL ok = [receipt writeToFile:p options:NSDataWritingAtomic error:&err];
+        if (ok) {
+            _receiptPath = p;
+            [_log appendFormat:@"  Receipt written: %@ ✅\n", [p lastPathComponent]];
+            break;
+        } else {
+            [_log appendFormat:@"  %@: %@ ❌\n", [p lastPathComponent], err.localizedDescription];
+        }
+    }
+    
+    if (!_receiptPath) {
+        [_log appendString:@"  ALL WRITES FAILED!\n"];
     }
     [_log appendString:@"\n"];
 }
@@ -257,12 +261,20 @@ static void hooked_restored(id s, SEL c, id q) {
 
 static IMP _orig_receiptURL = NULL;
 static NSURL* hooked_receiptURL(id self, SEL _cmd) {
-    // Point to our fake receipt
-    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"StoreKit/sandboxReceipt"];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
-        [_log appendString:@"[RECEIPT] -> fake receipt\n"];
-        return [NSURL fileURLWithPath:p];
+    // Try all our writable receipt locations
+    NSArray *paths = @[
+        [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches/fakereceipt"],
+        [NSHomeDirectory() stringByAppendingPathComponent:@"Library/fakereceipt"],
+        [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/fakereceipt"],
+        [NSHomeDirectory() stringByAppendingPathComponent:@"tmp/fakereceipt"],
+    ];
+    for (NSString *p in paths) {
+        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
+            [_log appendString:@"[RECEIPT] -> serving fake receipt ✅\n"];
+            return [NSURL fileURLWithPath:p];
+        }
     }
+    [_log appendString:@"[RECEIPT] -> no fake found, using original\n"];
     return ((NSURL*(*)(id, SEL))_orig_receiptURL)(self, _cmd);
 }
 
