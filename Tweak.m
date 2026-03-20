@@ -395,7 +395,7 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v29 INJECT ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v30 FAKE TX ===\n\n"];
     
     // 0. Hook Security framework verify functions
     {
@@ -638,20 +638,79 @@ static void tweak_init(void) {
         if (iapManager) {
             [_log appendFormat:@"[INJECT] Found IAP manager instance ✅\n"];
             
-            // Create fake SKPayment
-            SKMutablePayment *payment = [[SKMutablePayment alloc] init];
-            [payment setProductIdentifier:@"hfr.m.y"];
-            
-            // We can't create SKPaymentTransaction directly, but we can call 
-            // the original (unhooked) method with our hooked state
-            // Let _fakeState = YES so transactionState returns "Purchased"
             _fakeState = YES;
             
-            // Trigger restore flow - this calls the original handler
-            // The IAP manager will call backend->purchaseSucceeded via C++
+            // Create a dynamic class that acts as SKPaymentTransaction
+            static Class FakeTxClass = Nil;
+            if (!FakeTxClass) {
+                FakeTxClass = objc_allocateClassPair([NSObject class], "FakeTransaction", 0);
+                
+                // transactionState -> SKPaymentTransactionStateRestored (3)
+                class_addMethod(FakeTxClass, @selector(transactionState), imp_implementationWithBlock(^NSInteger(id self) {
+                    return 3; // SKPaymentTransactionStateRestored
+                }), "q@:");
+                
+                // payment -> SKPayment with productIdentifier "hfr.m.y"
+                class_addMethod(FakeTxClass, @selector(payment), imp_implementationWithBlock(^id(id self) {
+                    SKMutablePayment *p = [[SKMutablePayment alloc] init];
+                    [p setProductIdentifier:@"hfr.m.y"];
+                    return p;
+                }), "@@:");
+                
+                // transactionIdentifier
+                class_addMethod(FakeTxClass, @selector(transactionIdentifier), imp_implementationWithBlock(^NSString*(id self) {
+                    return @"FAKE_TX_200000099999";
+                }), "@@:");
+                
+                // transactionDate
+                class_addMethod(FakeTxClass, @selector(transactionDate), imp_implementationWithBlock(^NSDate*(id self) {
+                    return [NSDate date];
+                }), "@@:");
+                
+                // originalTransaction
+                class_addMethod(FakeTxClass, @selector(originalTransaction), imp_implementationWithBlock(^id(id self) {
+                    return nil;
+                }), "@@:");
+                
+                // transactionReceipt (deprecated but some apps use it)
+                class_addMethod(FakeTxClass, @selector(transactionReceipt), imp_implementationWithBlock(^NSData*(id self) {
+                    return _globalReceipt;
+                }), "@@:");
+                
+                // error
+                class_addMethod(FakeTxClass, @selector(error), imp_implementationWithBlock(^id(id self) {
+                    return nil;
+                }), "@@:");
+                
+                objc_registerClassPair(FakeTxClass);
+            }
+            
+            id fakeTx = [[FakeTxClass alloc] init];
+            NSArray *txArray = @[fakeTx];
+            
             @try {
-                // Call restoreCompletedTransactionsFinished first
-                [iapManager paymentQueueRestoreCompletedTransactionsFinished:queue];
+                // Call the ORIGINAL (unhooked) updatedTransactions with our fake tx
+                // This goes to InAppPurchaseManager's real handler -> C++ backend
+                if (_orig_updated) {
+                    ((void(*)(id, SEL, id, NSArray*))_orig_updated)(iapManager, 
+                        @selector(paymentQueue:updatedTransactions:), queue, txArray);
+                    [_log appendString:@"[INJECT] Called updatedTransactions with fake TX ✅\n"];
+                } else {
+                    // Hooks not set yet, call directly
+                    [iapManager paymentQueue:queue updatedTransactions:txArray];
+                    [_log appendString:@"[INJECT] Called updatedTransactions (direct) ✅\n"];
+                }
+            } @catch(NSException *e) {
+                [_log appendFormat:@"[INJECT] update error: %@\n", e];
+            }
+            
+            @try {
+                if (_orig_restored) {
+                    ((void(*)(id,SEL,id))_orig_restored)(iapManager,
+                        @selector(paymentQueueRestoreCompletedTransactionsFinished:), queue);
+                } else {
+                    [iapManager paymentQueueRestoreCompletedTransactionsFinished:queue];
+                }
                 [_log appendString:@"[INJECT] Called restoreCompleted ✅\n"];
             } @catch(NSException *e) {
                 [_log appendFormat:@"[INJECT] restore error: %@\n", e];
@@ -661,7 +720,6 @@ static void tweak_init(void) {
         } else {
             [_log appendFormat:@"[INJECT] IAP manager NOT found. Queue observers: %lu\n",
              (unsigned long)[observers count]];
-            // List all observers
             for (id obs in observers) {
                 [_log appendFormat:@"  observer: %@\n", NSStringFromClass([obs class])];
             }
