@@ -1,155 +1,123 @@
-// SVPlayerPatcher v6 - Smart auto-search
+// SVPlayerPatcher v7 - Dump NSUserDefaults + App Container files
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
 static UIWindow *_overlayWindow = nil;
 
-static NSString* scanClasses(void) {
-    int numClasses = objc_getClassList(NULL, 0);
-    Class *classes = (__unsafe_unretained Class *)malloc(sizeof(Class) * numClasses);
-    objc_getClassList(classes, numClasses);
+static NSString* scanEverything(void) {
+    NSMutableString *r = [NSMutableString string];
     
-    // Step 1: Find the app's Swift module name
-    NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
-    NSString *execName = [[[NSBundle mainBundle] executablePath] lastPathComponent];
+    // === PART 1: App info ===
+    [r appendFormat:@"=== SVPlayer Deep Scan v7 ===\n"];
+    [r appendFormat:@"Bundle: %@\n", [[NSBundle mainBundle] bundleIdentifier]];
+    [r appendFormat:@"Container: %@\n\n", NSHomeDirectory()];
     
-    NSMutableString *results = [NSMutableString string];
-    [results appendFormat:@"=== SVPlayer Smart Scan ===\n"];
-    [results appendFormat:@"Bundle: %@\n", bundleID];
-    [results appendFormat:@"Executable: %@\n\n", execName];
-    
-    // Step 2: Collect all unique module names (Swift classes have dots)
-    NSMutableDictionary *moduleCount = [NSMutableDictionary dictionary];
-    NSMutableArray *appClasses = [NSMutableArray array];
-    
-    for (int i = 0; i < numClasses; i++) {
-        const char *name = class_getName(classes[i]);
-        if (!name) continue;
-        NSString *cn = [NSString stringWithUTF8String:name];
-        
-        // Swift classes: ModuleName.ClassName
-        NSRange dotRange = [cn rangeOfString:@"."];
-        if (dotRange.location != NSNotFound) {
-            NSString *module = [cn substringToIndex:dotRange.location];
-            NSNumber *count = moduleCount[module] ?: @0;
-            moduleCount[module] = @(count.intValue + 1);
+    // === PART 2: NSUserDefaults - ALL keys ===
+    [r appendString:@"=== NSUserDefaults ===\n\n"];
+    NSDictionary *defaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+    NSArray *sortedKeys = [defaults.allKeys sortedArrayUsingSelector:@selector(compare:)];
+    for (NSString *key in sortedKeys) {
+        id value = defaults[key];
+        NSString *valStr;
+        if ([value isKindOfClass:[NSData class]]) {
+            valStr = [NSString stringWithFormat:@"<Data %lu bytes>", (unsigned long)[(NSData*)value length]];
+        } else if ([value isKindOfClass:[NSArray class]] || [value isKindOfClass:[NSDictionary class]]) {
+            NSData *jsonData = [NSJSONSerialization dataWithJSONObject:value options:0 error:nil];
+            valStr = jsonData ? [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding] : [value description];
+            if (valStr.length > 200) valStr = [[valStr substringToIndex:200] stringByAppendingString:@"..."];
+        } else {
+            valStr = [value description];
+            if (valStr.length > 200) valStr = [[valStr substringToIndex:200] stringByAppendingString:@"..."];
         }
+        [r appendFormat:@"KEY: %@\n  = %@\n\n", key, valStr];
     }
     
-    // Step 3: Find the app's module (non-Apple module with most classes)
-    [results appendString:@"--- Swift Modules ---\n"];
-    NSArray *sortedModules = [moduleCount keysSortedByValueUsingComparator:^(id a, id b) {
-        return [b compare:a];
-    }];
+    // === PART 3: List ALL files in app container ===
+    [r appendString:@"\n=== App Container Files ===\n\n"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *home = NSHomeDirectory();
+    NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:home];
+    NSString *file;
+    int fileCount = 0;
+    NSMutableArray *interestingFiles = [NSMutableArray array];
     
-    // Known Apple modules to skip
-    NSSet *appleModules = [NSSet setWithArray:@[
-        @"SwiftUI", @"Swift", @"UIKit", @"Foundation", @"CoreData",
-        @"Combine", @"MapKit", @"Photos", @"AVFoundation", @"WebKit",
-        @"StoreKit", @"CloudKit", @"CoreLocation", @"Metal",
-        @"RealityKit", @"ARKit", @"SpriteKit", @"SceneKit",
-        @"NewsCore", @"_TtC", @"CoreMotion", @"HealthKit"
-    ]];
-    
-    NSString *appModule = nil;
-    for (NSString *module in sortedModules) {
-        int count = [moduleCount[module] intValue];
-        BOOL isApple = [appleModules containsObject:module] || 
-                       [module hasPrefix:@"_"] || [module hasPrefix:@"__"];
-        if (!isApple && count >= 3) {
-            [results appendFormat:@"%@ %@: %d classes\n", 
-             (appModule == nil ? @">>>" : @"   "), module, count];
-            if (appModule == nil) appModule = module;
+    while ((file = [enumerator nextObject])) {
+        fileCount++;
+        NSString *fullPath = [home stringByAppendingPathComponent:file];
+        NSDictionary *attrs = [fm attributesOfItemAtPath:fullPath error:nil];
+        unsigned long long size = [attrs fileSize];
+        
+        [r appendFormat:@"%@ (%llu bytes)\n", file, size];
+        
+        // Mark interesting files
+        NSString *ext = [file pathExtension].lowercaseString;
+        NSString *lower = file.lowercaseString;
+        if ([ext isEqualToString:@"plist"] || [ext isEqualToString:@"json"] ||
+            [ext isEqualToString:@"ini"] || [ext isEqualToString:@"conf"] ||
+            [ext isEqualToString:@"sqlite"] || [ext isEqualToString:@"db"] ||
+            [ext isEqualToString:@"xml"] || [ext isEqualToString:@"dat"] ||
+            [lower containsString:@"premium"] || [lower containsString:@"license"] ||
+            [lower containsString:@"purchase"] || [lower containsString:@"subscri"] ||
+            [lower containsString:@"receipt"] || [lower containsString:@"setting"]) {
+            [interestingFiles addObject:fullPath];
         }
     }
+    [r appendFormat:@"\nTotal: %d files\n", fileCount];
     
-    [results appendFormat:@"\nApp module detected: %@\n\n", appModule ?: @"NONE"];
-    
-    // Step 4: Dump ALL classes from the app module
-    if (appModule) {
-        [results appendFormat:@"--- All %@ classes ---\n\n", appModule];
-        NSString *prefix = [appModule stringByAppendingString:@"."];
+    // === PART 4: Read interesting small files ===
+    [r appendString:@"\n=== Interesting File Contents ===\n\n"];
+    for (NSString *path in interestingFiles) {
+        NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
+        unsigned long long size = [attrs fileSize];
+        if (size > 50000) {
+            [r appendFormat:@"--- %@ (too large: %llu bytes) ---\n\n", [path lastPathComponent], size];
+            continue;
+        }
+        if (size == 0) continue;
         
-        for (int i = 0; i < numClasses; i++) {
-            const char *name = class_getName(classes[i]);
-            if (!name) continue;
-            NSString *cn = [NSString stringWithUTF8String:name];
-            
-            if (![cn hasPrefix:prefix]) continue;
-            
-            NSString *shortName = [cn substringFromIndex:prefix.length];
-            [results appendFormat:@"\nCLASS: %@\n", shortName];
-            
-            // Properties
-            unsigned int propCount = 0;
-            objc_property_t *props = class_copyPropertyList(classes[i], &propCount);
-            for (unsigned int j = 0; j < propCount; j++) {
-                [results appendFormat:@"  P: %s\n", property_getName(props[j])];
-            }
-            if (props) free(props);
-            
-            // Key methods only
-            unsigned int mc = 0;
-            Method *methods = class_copyMethodList(classes[i], &mc);
-            for (unsigned int j = 0; j < mc; j++) {
-                SEL sel = method_getName(methods[j]);
-                NSString *sn = NSStringFromSelector(sel);
-                NSString *ls = [sn lowercaseString];
-                if ([ls hasPrefix:@"is"] || [ls hasPrefix:@"has"] || [ls hasPrefix:@"set"] ||
-                    [ls containsString:@"init"] || [ls containsString:@"premium"] ||
-                    [ls containsString:@"purchase"] || [ls containsString:@"subscri"] ||
-                    [ls containsString:@"unlock"] || [ls containsString:@"license"] ||
-                    [ls containsString:@"paid"] || [ls containsString:@"pro"] ||
-                    [ls containsString:@"enable"] || [ls containsString:@"active"] ||
-                    [ls containsString:@"valid"] || [ls containsString:@"expire"] ||
-                    [ls containsString:@"interpolat"] || [ls containsString:@"fps"] ||
-                    [ls containsString:@"frame"] || [ls containsString:@"smooth"] ||
-                    [ls containsString:@"frc"] || [ls containsString:@"motion"]) {
-                    [results appendFormat:@"  M: %@\n", sn];
+        [r appendFormat:@"--- %@ (%llu bytes) ---\n", [path lastPathComponent], size];
+        
+        NSString *ext = [path pathExtension].lowercaseString;
+        if ([ext isEqualToString:@"plist"]) {
+            NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:path];
+            if (plist) {
+                for (NSString *key in plist) {
+                    [r appendFormat:@"  %@ = %@\n", key, plist[key]];
                 }
+            } else {
+                NSArray *arr = [NSArray arrayWithContentsOfFile:path];
+                if (arr) [r appendFormat:@"  %@\n", arr];
             }
-            if (methods) free(methods);
-        }
-    }
-
-    // Step 5: Also scan for non-Swift (ObjC) classes from app bundle
-    [results appendString:@"\n\n--- Non-Swift app classes ---\n"];
-    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
-    for (int i = 0; i < numClasses; i++) {
-        const char *name = class_getName(classes[i]);
-        if (!name) continue;
-        NSString *cn = [NSString stringWithUTF8String:name];
-        
-        // Skip if it has a dot (already covered above) or starts with underscore
-        if ([cn containsString:@"."] || [cn hasPrefix:@"_"]) continue;
-        if (cn.length < 4) continue;
-        
-        // Check if the class binary lives in the app bundle
-        NSBundle *classBundle = [NSBundle bundleForClass:classes[i]];
-        if (classBundle && [[classBundle bundlePath] hasPrefix:bundlePath]) {
-            [results appendFormat:@"\nCLASS: %@\n", cn];
-            unsigned int propCount = 0;
-            objc_property_t *props = class_copyPropertyList(classes[i], &propCount);
-            for (unsigned int j = 0; j < propCount; j++) {
-                [results appendFormat:@"  P: %s\n", property_getName(props[j])];
+        } else if ([ext isEqualToString:@"json"]) {
+            NSData *data = [NSData dataWithContentsOfFile:path];
+            NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (str.length > 2000) str = [[str substringToIndex:2000] stringByAppendingString:@"..."];
+            [r appendFormat:@"  %@\n", str];
+        } else {
+            NSData *data = [NSData dataWithContentsOfFile:path];
+            NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (str) {
+                if (str.length > 2000) str = [[str substringToIndex:2000] stringByAppendingString:@"..."];
+                [r appendFormat:@"  %@\n", str];
+            } else {
+                [r appendFormat:@"  <binary data>\n"];
             }
-            if (props) free(props);
         }
+        [r appendString:@"\n"];
     }
     
-    free(classes);
-    return results;
+    return r;
 }
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        NSString *results = scanClasses();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NSString *results = scanEverything();
         [UIPasteboard generalPasteboard].string = results;
         
         NSString *docsPath = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-        [results writeToFile:[docsPath stringByAppendingPathComponent:@"svplayer_classes.txt"]
+        [results writeToFile:[docsPath stringByAppendingPathComponent:@"svplayer_dump.txt"]
                   atomically:YES encoding:NSUTF8StringEncoding error:nil];
         
         UIWindowScene *scene = nil;
@@ -164,7 +132,7 @@ static void tweak_init(void) {
         
         CGRect b = _overlayWindow.bounds;
         UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(20, 50, b.size.width - 40, 30)];
-        t.text = @"SMART SCAN DONE - COPIED TO CLIPBOARD - 60s";
+        t.text = @"DEEP SCAN DONE - COPIED - closes in 60s";
         t.textColor = [UIColor cyanColor];
         t.font = [UIFont boldSystemFontOfSize:14];
         [_overlayWindow.rootViewController.view addSubview:t];
