@@ -1,21 +1,11 @@
-// SVPlayerPatcher v8 - Premium activation attempt
+// SVPlayerPatcher v8b - Premium activation (fixed compilation)
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <StoreKit/StoreKit.h>
 #import <objc/runtime.h>
 
 static UIWindow *_overlayWindow = nil;
 
-// === Method Swizzling Helper ===
-static void swizzleMethod(Class cls, SEL orig, SEL swizzled) {
-    Method origMethod = class_getInstanceMethod(cls, orig);
-    Method swizMethod = class_getInstanceMethod(cls, swizzled);
-    if (origMethod && swizMethod) {
-        method_exchangeImplementations(origMethod, swizMethod);
-    }
-}
-
-// === Patch 1: Modify main.cfg ===
+// === Patch main.cfg ===
 static void patchMainCfg(NSMutableString *log) {
     NSString *cfgPath = [NSHomeDirectory() stringByAppendingPathComponent:
                          @"Library/Application Support/SVPlayer/settings/main.cfg"];
@@ -26,127 +16,131 @@ static void patchMainCfg(NSMutableString *log) {
     NSError *err;
     NSMutableDictionary *cfg = [NSJSONSerialization JSONObjectWithData:data 
                                 options:NSJSONReadingMutableContainers error:&err];
-    if (!cfg) { [log appendFormat:@"[FAIL] parse main.cfg: %@\n", err]; return; }
+    if (!cfg) { [log appendFormat:@"[FAIL] parse: %@\n", err]; return; }
     
-    // Save original values
-    [log appendFormat:@"[INFO] Original h/pid: %@\n", cfg[@"h/pid"]];
-    [log appendFormat:@"[INFO] Original h/last_check: %@\n", cfg[@"h/last_check"]];
-    [log appendFormat:@"[INFO] Original h/uid: %@\n", cfg[@"h/uid"]];
+    [log appendFormat:@"[OLD] h/pid = %@\n", cfg[@"h/pid"]];
+    [log appendFormat:@"[OLD] h/last_check = %@\n", cfg[@"h/last_check"]];
     
-    // Set fake purchase ID (looks like App Store transaction)
+    // Patch values
     cfg[@"h/pid"] = @"2000000845671234";
+    cfg[@"h/last_check"] = @(1893456000); // year 2030
     
-    // Set last_check to far future (year 2030)
-    cfg[@"h/last_check"] = @(1893456000);
-    
-    // Write back
     NSData *newData = [NSJSONSerialization dataWithJSONObject:cfg 
                        options:NSJSONWritingPrettyPrinted error:&err];
     if (newData && [newData writeToFile:cfgPath atomically:YES]) {
-        [log appendString:@"[OK] main.cfg patched (h/pid + h/last_check)\n"];
+        [log appendString:@"[OK] main.cfg patched\n"];
     } else {
-        [log appendFormat:@"[FAIL] write main.cfg: %@\n", err];
+        [log appendFormat:@"[FAIL] write: %@\n", err];
     }
 }
 
-// === Patch 2: Inject fake StoreKit receipt ===
-@interface NSBundle (SVPatch)
-- (NSURL *)svp_appStoreReceiptURL;
-@end
-
-@implementation NSBundle (SVPatch)
-- (NSURL *)svp_appStoreReceiptURL {
-    // Return a path to our fake receipt
-    NSString *fakePath = [NSHomeDirectory() stringByAppendingPathComponent:
-                          @"Library/Application Support/SVPlayer/settings/fake_receipt"];
+// === Patch svp.lic - try deleting it to trigger re-validation ===
+static void patchLicense(NSMutableString *log) {
+    NSString *licPath = [NSHomeDirectory() stringByAppendingPathComponent:
+                         @"Library/Application Support/SVPlayer/settings/svp.lic"];
     
-    // Create minimal receipt file if not exists
-    if (![[NSFileManager defaultManager] fileExistsAtPath:fakePath]) {
-        // Create a minimal ASN.1 receipt-like data
-        [@"fake_receipt_data" writeToFile:fakePath atomically:YES 
-                                encoding:NSUTF8StringEncoding error:nil];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:licPath]) {
+        // Read current license
+        NSString *lic = [NSString stringWithContentsOfFile:licPath 
+                         encoding:NSUTF8StringEncoding error:nil];
+        [log appendFormat:@"[INFO] Current svp.lic: %@\n", 
+         [lic substringToIndex:MIN(50, lic.length)]];
+    }
+}
+
+// === Hook NSUserDefaults to intercept premium checks ===
+static IMP _orig_objectForKey = NULL;
+
+static id hooked_objectForKey(id self, SEL _cmd, NSString *key) {
+    // Call original
+    id result = ((id(*)(id, SEL, NSString*))_orig_objectForKey)(self, _cmd, key);
+    
+    // Intercept premium-related keys
+    if (key && [key isKindOfClass:[NSString class]]) {
+        NSString *lk = [key lowercaseString];
+        if ([lk containsString:@"premium"] || [lk containsString:@"purchased"] ||
+            [lk containsString:@"is_pro"] || [lk containsString:@"pro_enabled"]) {
+            NSLog(@"[SVPatcher] Intercepted key: %@ (was: %@) -> YES", key, result);
+            return @YES;
+        }
+    }
+    return result;
+}
+
+// === Hook NSUserDefaults boolForKey ===
+static IMP _orig_boolForKey = NULL;
+
+static BOOL hooked_boolForKey(id self, SEL _cmd, NSString *key) {
+    BOOL result = ((BOOL(*)(id, SEL, NSString*))_orig_boolForKey)(self, _cmd, key);
+    
+    if (key && [key isKindOfClass:[NSString class]]) {
+        NSString *lk = [key lowercaseString];
+        if ([lk containsString:@"premium"] || [lk containsString:@"purchased"] ||
+            [lk containsString:@"is_pro"] || [lk containsString:@"pro_enabled"] ||
+            [lk containsString:@"unlocked"]) {
+            NSLog(@"[SVPatcher] Intercepted boolForKey: %@ -> YES", key);
+            return YES;
+        }
+    }
+    return result;
+}
+
+static void applyHooks(NSMutableString *log) {
+    // Hook objectForKey:
+    Method m1 = class_getInstanceMethod([NSUserDefaults class], @selector(objectForKey:));
+    if (m1) {
+        _orig_objectForKey = method_setImplementation(m1, (IMP)hooked_objectForKey);
+        [log appendString:@"[OK] Hooked NSUserDefaults.objectForKey\n"];
     }
     
-    return [NSURL fileURLWithPath:fakePath];
-}
-@end
-
-// === Patch 3: Hook SKPaymentTransactionObserver ===
-@interface SKPaymentTransaction (SVPatch)
-- (SKPaymentTransactionState)svp_transactionState;
-@end
-
-@implementation SKPaymentTransaction (SVPatch)
-- (SKPaymentTransactionState)svp_transactionState {
-    // Always return "purchased"
-    return SKPaymentTransactionStatePurchased;
-}
-@end
-
-// === Patch 4: Intercept UserDefaults reads ===
-@interface NSUserDefaults (SVPatch)
-- (id)svp_objectForKey:(NSString *)key;
-@end
-
-@implementation NSUserDefaults (SVPatch)
-- (id)svp_objectForKey:(NSString *)key {
-    NSString *lk = [key lowercaseString];
-    if ([lk containsString:@"premium"] || [lk containsString:@"purchased"] ||
-        [lk containsString:@"pro_enabled"] || [lk containsString:@"is_pro"]) {
-        return @YES;
+    // Hook boolForKey:
+    Method m2 = class_getInstanceMethod([NSUserDefaults class], @selector(boolForKey:));
+    if (m2) {
+        _orig_boolForKey = method_setImplementation(m2, (IMP)hooked_boolForKey);
+        [log appendString:@"[OK] Hooked NSUserDefaults.boolForKey\n"];
     }
-    if ([lk containsString:@"trial"] || [lk containsString:@"expire"]) {
-        // Return far future date
-        return [NSDate dateWithTimeIntervalSince1970:1893456000];
-    }
-    return [self svp_objectForKey:key]; // call original
 }
-@end
 
-// === Patch 5: Modify svp.lic check by intercepting file reads ===
-// Hook NSData initWithContentsOfFile to return modified data for svp.lic
-@interface NSData (SVPatch)
-+ (instancetype)svp_dataWithContentsOfFile:(NSString *)path;
-@end
-
-@implementation NSData (SVPatch)
-+ (instancetype)svp_dataWithContentsOfFile:(NSString *)path {
-    // Don't intercept svp.lic reads - let original handle it
-    // But log when it's accessed
-    if ([path containsString:@"svp.lic"]) {
-        NSLog(@"[SVPatcher] svp.lic accessed: %@", path);
+// === Read and patch QML config ===
+static void checkQMLConfig(NSMutableString *log) {
+    // Check if there are any QSettings files
+    NSString *settingsDir = [NSHomeDirectory() stringByAppendingPathComponent:
+                             @"Library/Application Support/SVPlayer/settings"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *files = [fm contentsOfDirectoryAtPath:settingsDir error:nil];
+    
+    [log appendString:@"\n[INFO] Settings files:\n"];
+    for (NSString *f in files) {
+        NSString *full = [settingsDir stringByAppendingPathComponent:f];
+        NSDictionary *attrs = [fm attributesOfItemAtPath:full error:nil];
+        [log appendFormat:@"  %@ (%llu bytes)\n", f, [attrs fileSize]];
     }
-    return [NSData svp_dataWithContentsOfFile:path]; // call original (swizzled)
-}
-@end
-
-static void applyPatches(NSMutableString *log) {
-    // Patch 1: Config files
-    patchMainCfg(log);
     
-    // Patch 2: Swizzle receipt URL
-    swizzleMethod([NSBundle class],
-                  @selector(appStoreReceiptURL),
-                  @selector(svp_appStoreReceiptURL));
-    [log appendString:@"[OK] Swizzled appStoreReceiptURL\n"];
-    
-    // Patch 3: Swizzle transaction state
-    swizzleMethod([SKPaymentTransaction class],
-                  @selector(transactionState),
-                  @selector(svp_transactionState));
-    [log appendString:@"[OK] Swizzled SKPaymentTransaction.transactionState\n"];
-    
-    // Patch 4: Swizzle UserDefaults
-    swizzleMethod([NSUserDefaults class],
-                  @selector(objectForKey:),
-                  @selector(svp_objectForKey:));
-    [log appendString:@"[OK] Swizzled NSUserDefaults.objectForKey\n"];
-    
-    [log appendString:@"\n[INFO] All patches applied. Restart app to see effect.\n"];
-    [log appendString:@"[INFO] If premium not active, try:\n"];
-    [log appendString:@"  1. Force close SVPlayer\n"];
-    [log appendString:@"  2. Reopen it\n"];
-    [log appendString:@"  3. Check if 60fps works\n"];
+    // After patching main.cfg, also check if we need to modify profiles
+    // to enable FRC regardless of license
+    NSString *profilesPath = [settingsDir stringByAppendingPathComponent:@"profiles.cfg"];
+    NSData *pdata = [NSData dataWithContentsOfFile:profilesPath];
+    if (pdata) {
+        NSMutableDictionary *profiles = [NSJSONSerialization JSONObjectWithData:pdata
+                                         options:NSJSONReadingMutableContainers error:nil];
+        if (profiles) {
+            // Ensure the default profile has FRC enabled
+            for (NSString *key in profiles.allKeys) {
+                if ([key hasSuffix:@"/on"]) {
+                    profiles[key] = @YES;
+                    [log appendFormat:@"[OK] Enabled profile: %@\n", key];
+                }
+                if ([key hasSuffix:@"/enable"]) {
+                    profiles[key] = @YES;
+                }
+            }
+            NSData *newPdata = [NSJSONSerialization dataWithJSONObject:profiles 
+                                options:NSJSONWritingPrettyPrinted error:nil];
+            [newPdata writeToFile:profilesPath atomically:YES];
+            [log appendString:@"[OK] profiles.cfg patched\n"];
+        }
+    }
 }
 
 __attribute__((constructor))
@@ -154,7 +148,12 @@ static void tweak_init(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         NSMutableString *log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v8 ===\n\n"];
         
-        applyPatches(log);
+        patchMainCfg(log);
+        patchLicense(log);
+        applyHooks(log);
+        checkQMLConfig(log);
+        
+        [log appendString:@"\n[DONE] Close and reopen SVPlayer to test!\n"];
         
         [UIPasteboard generalPasteboard].string = log;
         
@@ -174,7 +173,7 @@ static void tweak_init(void) {
         
         CGRect b = _overlayWindow.bounds;
         UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(20, 50, b.size.width - 40, 30)];
-        t.text = @"PATCHES APPLIED - restart app to test";
+        t.text = @"v8 PATCHES APPLIED - close & reopen app";
         t.textColor = [UIColor cyanColor];
         t.font = [UIFont boldSystemFontOfSize:14];
         [_overlayWindow.rootViewController.view addSubview:t];
