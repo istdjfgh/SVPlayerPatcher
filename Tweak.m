@@ -1,4 +1,4 @@
-// SVPlayerPatcher v9 - StoreKit interception
+// SVPlayerPatcher v10 - Direct InAppPurchaseManager hook
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <StoreKit/StoreKit.h>
@@ -6,187 +6,192 @@
 #import <objc/message.h>
 
 static UIWindow *_overlayWindow = nil;
-static NSMutableString *_globalLog = nil;
-static id _capturedObserver = nil;
+static NSMutableString *_log = nil;
+static id _iapManager = nil;
 
-// === STEP 1: Capture the payment observer ===
-static IMP _orig_addTransactionObserver = NULL;
+// === Hook 1: Capture InAppPurchaseManager instance ===
+static IMP _orig_addObserver = NULL;
 
-static void hooked_addTransactionObserver(id self, SEL _cmd, id observer) {
-    _capturedObserver = observer;
-    [_globalLog appendFormat:@"[CAPTURE] Observer: %@\n", NSStringFromClass([observer class])];
+static void hooked_addObserver(id self, SEL _cmd, id observer) {
+    NSString *className = NSStringFromClass([observer class]);
+    [_log appendFormat:@"[CAPTURE] Observer: %@\n", className];
     
-    // Log all methods the observer responds to
-    unsigned int mc = 0;
-    Method *methods = class_copyMethodList([observer class], &mc);
-    for (unsigned int i = 0; i < mc; i++) {
-        SEL sel = method_getName(methods[i]);
-        NSString *name = NSStringFromSelector(sel);
-        NSString *ln = [name lowercaseString];
-        if ([ln containsString:@"payment"] || [ln containsString:@"transact"] ||
-            [ln containsString:@"purchase"] || [ln containsString:@"restore"] ||
-            [ln containsString:@"product"] || [ln containsString:@"update"] ||
-            [ln containsString:@"finish"] || [ln containsString:@"complet"]) {
-            [_globalLog appendFormat:@"  OBS_M: %@\n", name];
+    if ([className isEqualToString:@"InAppPurchaseManager"]) {
+        _iapManager = observer;
+        [_log appendString:@"[OK] InAppPurchaseManager captured!\n"];
+        
+        // Dump ALL methods
+        unsigned int mc = 0;
+        Method *methods = class_copyMethodList([observer class], &mc);
+        [_log appendFormat:@"[INFO] %d methods:\n", mc];
+        for (unsigned int i = 0; i < mc; i++) {
+            SEL sel = method_getName(methods[i]);
+            [_log appendFormat:@"  M: %@\n", NSStringFromSelector(sel)];
         }
+        if (methods) free(methods);
+        
+        // Dump ALL properties
+        unsigned int pc = 0;
+        objc_property_t *props = class_copyPropertyList([observer class], &pc);
+        [_log appendFormat:@"[INFO] %d properties:\n", pc];
+        for (unsigned int i = 0; i < pc; i++) {
+            const char *pn = property_getName(props[i]);
+            const char *pa = property_getAttributes(props[i]);
+            [_log appendFormat:@"  P: %s (%s)\n", pn, pa];
+        }
+        if (props) free(props);
+        
+        // Dump ALL ivars
+        unsigned int ic = 0;
+        Ivar *ivars = class_copyIvarList([observer class], &ic);
+        [_log appendFormat:@"[INFO] %d ivars:\n", ic];
+        for (unsigned int i = 0; i < ic; i++) {
+            const char *in = ivar_getName(ivars[i]);
+            const char *it = ivar_getTypeEncoding(ivars[i]);
+            
+            // Try to read ivar value
+            id value = nil;
+            @try {
+                value = object_getIvar(observer, ivars[i]);
+            } @catch (NSException *e) {
+                value = nil;
+            }
+            [_log appendFormat:@"  IV: %s (%s) = %@\n", in, it ? it : "?", value];
+        }
+        if (ivars) free(ivars);
     }
-    if (methods) free(methods);
+    
+    ((void(*)(id, SEL, id))_orig_addObserver)(self, _cmd, observer);
+}
+
+// === Hook 2: Intercept paymentQueue:updatedTransactions: ===
+static IMP _orig_updatedTransactions = NULL;
+
+static void hooked_updatedTransactions(id self, SEL _cmd, id queue, NSArray *transactions) {
+    [_log appendFormat:@"[INTERCEPT] updatedTransactions: %lu transactions\n", (unsigned long)transactions.count];
+    
+    for (SKPaymentTransaction *tx in transactions) {
+        [_log appendFormat:@"  TX state=%ld product=%@\n", 
+         (long)tx.transactionState, tx.payment.productIdentifier];
+    }
     
     // Call original
-    ((void(*)(id, SEL, id))_orig_addTransactionObserver)(self, _cmd, observer);
+    ((void(*)(id, SEL, id, NSArray*))_orig_updatedTransactions)(self, _cmd, queue, transactions);
 }
 
-// === STEP 2: Hook restoreCompletedTransactions ===
-static IMP _orig_restore = NULL;
+// === Hook 3: Intercept productsRequest:didReceiveResponse: ===
+static IMP _orig_productsResponse = NULL;
 
-static void hooked_restore(id self, SEL _cmd) {
-    [_globalLog appendString:@"[INTERCEPT] restoreCompletedTransactions called!\n"];
+static void hooked_productsResponse(id self, SEL _cmd, SKProductsRequest *request, SKProductsResponse *response) {
+    [_log appendString:@"[INTERCEPT] productsRequest:didReceiveResponse:\n"];
     
-    // Call original first
-    ((void(*)(id, SEL))_orig_restore)(self, _cmd);
-    
-    // Then try to call the observer's success method after a delay
-    if (_capturedObserver) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            // Try calling paymentQueueRestoreCompletedTransactionsFinished:
-            SEL finishSel = @selector(paymentQueueRestoreCompletedTransactionsFinished:);
-            if ([_capturedObserver respondsToSelector:finishSel]) {
-                [_globalLog appendString:@"[OK] Calling restoreFinished on observer\n"];
-                ((void(*)(id, SEL, id))objc_msgSend)(_capturedObserver, finishSel, self);
-            }
-        });
+    for (SKProduct *product in response.products) {
+        [_log appendFormat:@"  PRODUCT: %@ (%@) price=%@\n", 
+         product.productIdentifier, product.localizedTitle, product.price];
     }
+    
+    [_log appendFormat:@"  Invalid IDs: %@\n", response.invalidProductIdentifiers];
+    
+    ((void(*)(id, SEL, SKProductsRequest*, SKProductsResponse*))_orig_productsResponse)(self, _cmd, request, response);
 }
 
-// === STEP 3: Hook AppStore receipt check ===
-static IMP _orig_receiptURL = NULL;
+// === Hook 4: Intercept restoreFinished ===
+static IMP _orig_restoreFinished = NULL;
 
-static NSURL* hooked_receiptURL(id self, SEL _cmd) {
-    NSURL *orig = ((NSURL*(*)(id, SEL))_orig_receiptURL)(self, _cmd);
-    [_globalLog appendFormat:@"[INTERCEPT] appStoreReceiptURL: %@\n", orig.path];
-    return orig; // Don't modify, just log for now
+static void hooked_restoreFinished(id self, SEL _cmd, id queue) {
+    [_log appendString:@"[INTERCEPT] paymentQueueRestoreCompletedTransactionsFinished!\n"];
+    ((void(*)(id, SEL, id))_orig_restoreFinished)(self, _cmd, queue);
 }
 
-// === STEP 4: Hook NSURLSession to intercept Apple receipt validation ===
-static IMP _orig_dataTaskWithRequest = NULL;
+// === Hook 5: NSURLSession for server checks ===
+static IMP _orig_dataTask = NULL;
 
-static id hooked_dataTaskWithRequest(id self, SEL _cmd, NSURLRequest *request, void(^completion)(NSData*, NSURLResponse*, NSError*)) {
+static id hooked_dataTask(id self, SEL _cmd, NSURLRequest *request, void(^completion)(NSData*, NSURLResponse*, NSError*)) {
     NSString *url = request.URL.absoluteString;
     
-    if ([url containsString:@"apple.com"] || [url containsString:@"svp-team"] || 
-        [url containsString:@"sandbox.itunes"] || [url containsString:@"buy.itunes"]) {
-        [_globalLog appendFormat:@"[INTERCEPT] Network: %@\n", url];
+    if ([url containsString:@"svp-team"] || [url containsString:@"apple.com/verifyReceipt"] ||
+        [url containsString:@"sandbox.itunes"]) {
+        [_log appendFormat:@"[NET] %@ %@\n", request.HTTPMethod, url];
         
-        // If this is a receipt validation request to Apple or SVP servers
-        if ([url containsString:@"verifyReceipt"] || [url containsString:@"receipt"]) {
-            [_globalLog appendString:@"[FAKE] Returning fake valid receipt response\n"];
-            
-            // Return fake "valid" response
-            NSDictionary *fakeResponse = @{
-                @"status": @0,  // 0 = valid receipt
-                @"receipt": @{
-                    @"bundle_id": @"com.svpteam.svp",
-                    @"in_app": @[@{
-                        @"product_id": @"com.svpteam.svp.premium",
-                        @"transaction_id": @"2000000845671234",
-                        @"purchase_date": @"2025-01-01 00:00:00 Etc/GMT",
-                        @"expires_date": @"2030-01-01 00:00:00 Etc/GMT"
-                    }]
-                }
-            };
-            NSData *fakeData = [NSJSONSerialization dataWithJSONObject:fakeResponse options:0 error:nil];
-            NSHTTPURLResponse *fakeResp = [[NSHTTPURLResponse alloc] initWithURL:request.URL 
-                                           statusCode:200 HTTPVersion:@"HTTP/1.1" 
-                                           headerFields:@{@"Content-Type": @"application/json"}];
-            
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (completion) completion(fakeData, fakeResp, nil);
-            });
-            
-            // Return a dummy task
-            return [[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:@"about:blank"]];
-        }
-        
-        // If SVP server check
-        if ([url containsString:@"svp-team"]) {
-            [_globalLog appendString:@"[FAKE] Returning fake SVP server response\n"];
-            NSDictionary *fakeResponse = @{@"status": @"ok", @"licensed": @YES, @"expires": @"2030-01-01"};
-            NSData *fakeData = [NSJSONSerialization dataWithJSONObject:fakeResponse options:0 error:nil];
-            NSHTTPURLResponse *fakeResp = [[NSHTTPURLResponse alloc] initWithURL:request.URL 
-                                           statusCode:200 HTTPVersion:@"HTTP/1.1" 
-                                           headerFields:@{@"Content-Type": @"application/json"}];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (completion) completion(fakeData, fakeResp, nil);
-            });
-            return [[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:@"about:blank"]];
+        if (request.HTTPBody) {
+            NSString *body = [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding];
+            if (body) [_log appendFormat:@"[NET] Body: %.200s...\n", body.UTF8String];
         }
     }
     
-    return ((id(*)(id, SEL, NSURLRequest*, void(^)(NSData*, NSURLResponse*, NSError*)))_orig_dataTaskWithRequest)(self, _cmd, request, completion);
+    return ((id(*)(id, SEL, NSURLRequest*, void(^)(NSData*, NSURLResponse*, NSError*)))_orig_dataTask)(self, _cmd, request, completion);
 }
 
-// === STEP 5: Patch main.cfg ===
-static void patchMainCfg(void) {
+// === Patch main.cfg ===
+static void patchConfig(void) {
     NSString *cfgPath = [NSHomeDirectory() stringByAppendingPathComponent:
                          @"Library/Application Support/SVPlayer/settings/main.cfg"];
     NSData *data = [NSData dataWithContentsOfFile:cfgPath];
     if (!data) return;
-    
     NSMutableDictionary *cfg = [NSJSONSerialization JSONObjectWithData:data 
                                 options:NSJSONReadingMutableContainers error:nil];
     if (!cfg) return;
-    
     cfg[@"h/pid"] = @"2000000845671234";
     cfg[@"h/last_check"] = @(1893456000);
-    
-    NSData *newData = [NSJSONSerialization dataWithJSONObject:cfg 
-                       options:NSJSONWritingPrettyPrinted error:nil];
-    [newData writeToFile:cfgPath atomically:YES];
-    [_globalLog appendString:@"[OK] main.cfg patched\n"];
+    NSData *nd = [NSJSONSerialization dataWithJSONObject:cfg options:NSJSONWritingPrettyPrinted error:nil];
+    [nd writeToFile:cfgPath atomically:YES];
+    [_log appendString:@"[OK] main.cfg patched\n"];
 }
 
-static void applyAllHooks(void) {
-    // Hook SKPaymentQueue addTransactionObserver:
-    Method m1 = class_getInstanceMethod([SKPaymentQueue class], @selector(addTransactionObserver:));
+static void applyHooks(void) {
+    // Hook addTransactionObserver
+    Class skpq = [SKPaymentQueue class];
+    Method m1 = class_getInstanceMethod(skpq, @selector(addTransactionObserver:));
     if (m1) {
-        _orig_addTransactionObserver = method_setImplementation(m1, (IMP)hooked_addTransactionObserver);
-        [_globalLog appendString:@"[OK] Hooked addTransactionObserver\n"];
+        _orig_addObserver = method_setImplementation(m1, (IMP)hooked_addObserver);
+        [_log appendString:@"[OK] Hook addTransactionObserver\n"];
     }
     
-    // Hook restoreCompletedTransactions
-    Method m2 = class_getInstanceMethod([SKPaymentQueue class], @selector(restoreCompletedTransactions));
-    if (m2) {
-        _orig_restore = method_setImplementation(m2, (IMP)hooked_restore);
-        [_globalLog appendString:@"[OK] Hooked restoreCompletedTransactions\n"];
+    // Hook NSURLSession
+    Method m5 = class_getInstanceMethod([NSURLSession class], @selector(dataTaskWithRequest:completionHandler:));
+    if (m5) {
+        _orig_dataTask = method_setImplementation(m5, (IMP)hooked_dataTask);
+        [_log appendString:@"[OK] Hook NSURLSession.dataTask\n"];
     }
     
-    // Hook appStoreReceiptURL
-    Method m3 = class_getInstanceMethod([NSBundle class], @selector(appStoreReceiptURL));
-    if (m3) {
-        _orig_receiptURL = method_setImplementation(m3, (IMP)hooked_receiptURL);
-        [_globalLog appendString:@"[OK] Hooked appStoreReceiptURL\n"];
-    }
+    patchConfig();
     
-    // Hook NSURLSession dataTaskWithRequest:completionHandler:
-    Method m4 = class_getInstanceMethod([NSURLSession class], @selector(dataTaskWithRequest:completionHandler:));
-    if (m4) {
-        _orig_dataTaskWithRequest = method_setImplementation(m4, (IMP)hooked_dataTaskWithRequest);
-        [_globalLog appendString:@"[OK] Hooked NSURLSession dataTask\n"];
-    }
-    
-    patchMainCfg();
+    // Hook InAppPurchaseManager methods AFTER observer is registered
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        Class iapClass = NSClassFromString(@"InAppPurchaseManager");
+        if (iapClass) {
+            [_log appendString:@"[OK] Found InAppPurchaseManager class\n"];
+            
+            Method m2 = class_getInstanceMethod(iapClass, @selector(paymentQueue:updatedTransactions:));
+            if (m2) {
+                _orig_updatedTransactions = method_setImplementation(m2, (IMP)hooked_updatedTransactions);
+                [_log appendString:@"[OK] Hook paymentQueue:updatedTransactions:\n"];
+            }
+            
+            Method m3 = class_getInstanceMethod(iapClass, @selector(productsRequest:didReceiveResponse:));
+            if (m3) {
+                _orig_productsResponse = method_setImplementation(m3, (IMP)hooked_productsResponse);
+                [_log appendString:@"[OK] Hook productsRequest:didReceiveResponse:\n"];
+            }
+            
+            Method m4 = class_getInstanceMethod(iapClass, @selector(paymentQueueRestoreCompletedTransactionsFinished:));
+            if (m4) {
+                _orig_restoreFinished = method_setImplementation(m4, (IMP)hooked_restoreFinished);
+                [_log appendString:@"[OK] Hook restoreFinished\n"];
+            }
+        } else {
+            [_log appendString:@"[FAIL] InAppPurchaseManager class not found\n"];
+        }
+    });
 }
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _globalLog = [NSMutableString stringWithString:@"=== SVPlayerPatcher v9 ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v10 ===\n\n"];
+    applyHooks();
     
-    // Apply hooks EARLY (before app loads UI)
-    applyAllHooks();
-    
-    // Show log overlay after delay
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [UIPasteboard generalPasteboard].string = _globalLog;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [UIPasteboard generalPasteboard].string = _log;
         
         UIWindowScene *scene = nil;
         for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) { scene = s; break; }
@@ -200,14 +205,15 @@ static void tweak_init(void) {
         
         CGRect b = _overlayWindow.bounds;
         UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(20, 50, b.size.width - 40, 30)];
-        t.text = @"v9 StoreKit Hooks - tap Restore in SVPlayer!";
+        t.text = @"v10 - CLOSE THIS, tap Buy/Restore, then paste log";
         t.textColor = [UIColor cyanColor];
-        t.font = [UIFont boldSystemFontOfSize:14];
+        t.font = [UIFont boldSystemFontOfSize:13];
+        t.adjustsFontSizeToFitWidth = YES;
         [_overlayWindow.rootViewController.view addSubview:t];
         
         UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(10, 90, b.size.width - 20, b.size.height - 100)];
-        tv.text = _globalLog;
-        tv.font = [UIFont fontWithName:@"Menlo" size:11];
+        tv.text = _log;
+        tv.font = [UIFont fontWithName:@"Menlo" size:10];
         tv.textColor = [UIColor greenColor];
         tv.backgroundColor = [UIColor clearColor];
         tv.editable = NO;
@@ -217,15 +223,18 @@ static void tweak_init(void) {
         _overlayWindow.hidden = NO;
         [_overlayWindow makeKeyAndVisible];
         
-        // Update log view periodically
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            UITextView *logView = [_overlayWindow.rootViewController.view viewWithTag:999];
-            if (logView) logView.text = _globalLog;
-            [UIPasteboard generalPasteboard].string = _globalLog;
-        });
+        // Auto-update log every 5 sec
+        for (int i = 1; i <= 12; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                UITextView *lv = (UITextView*)[_overlayWindow.rootViewController.view viewWithTag:999];
+                if (lv) lv.text = _log;
+                [UIPasteboard generalPasteboard].string = _log;
+            });
+        }
         
+        // Close after 60s
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [UIPasteboard generalPasteboard].string = _globalLog;
+            [UIPasteboard generalPasteboard].string = _log;
             _overlayWindow.hidden = YES;
             _overlayWindow = nil;
         });
