@@ -295,6 +295,48 @@ static void tweak_init(void) {
         [_log appendString:@"[OK] receiptURL hook\n"];
     }
     
+    // 3b. Hook NSData reads to inject our receipt data
+    static NSData *_fakeReceiptData = nil;
+    _fakeReceiptData = buildFakeReceipt([[NSBundle mainBundle] bundleIdentifier] ?: @"com.svpteam.svp");
+    
+    // Store receipt data globally
+    static __strong NSData *_globalReceipt = nil;
+    _globalReceipt = _fakeReceiptData;
+    
+    // Hook NSData initWithContentsOfURL:
+    {
+        Method dm = class_getInstanceMethod([NSData class], @selector(initWithContentsOfURL:));
+        if (dm) {
+            static IMP _orig_dataURL = NULL;
+            _orig_dataURL = method_setImplementation(dm, imp_implementationWithBlock(^NSData*(id self, NSURL *url) {
+                if ([url.path containsString:@"receipt"] || [url.path containsString:@"Receipt"]) {
+                    [_log appendFormat:@"[DATA-URL] %@ -> FAKE ✅\n", [url.path lastPathComponent]];
+                    [UIPasteboard generalPasteboard].string = _log;
+                    return _globalReceipt;
+                }
+                return ((NSData*(*)(id, SEL, NSURL*))_orig_dataURL)(self, @selector(initWithContentsOfURL:), url);
+            }));
+            [_log appendString:@"[OK] NSData URL hook\n"];
+        }
+    }
+    
+    // Hook NSData initWithContentsOfFile:
+    {
+        Method dm = class_getInstanceMethod([NSData class], @selector(initWithContentsOfFile:));
+        if (dm) {
+            static IMP _orig_dataFile = NULL;
+            _orig_dataFile = method_setImplementation(dm, imp_implementationWithBlock(^NSData*(id self, NSString *path) {
+                if ([path containsString:@"receipt"] || [path containsString:@"Receipt"]) {
+                    [_log appendFormat:@"[DATA-FILE] %@ -> FAKE ✅\n", [path lastPathComponent]];
+                    [UIPasteboard generalPasteboard].string = _log;
+                    return _globalReceipt;
+                }
+                return ((NSData*(*)(id, SEL, NSString*))_orig_dataFile)(self, @selector(initWithContentsOfFile:), path);
+            }));
+            [_log appendString:@"[OK] NSData File hook\n"];
+        }
+    }
+    
     // 4. StoreKit hooks
     m = class_getInstanceMethod([SKPaymentTransaction class], @selector(transactionState));
     if (m) _orig_txState = method_setImplementation(m, (IMP)hooked_txState);
