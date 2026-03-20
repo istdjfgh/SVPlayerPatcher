@@ -15,7 +15,11 @@ static BOOL _fakeState = NO;
 static void verifyPatch(void) {
     [_log appendString:@"=== Patch Verification ===\n"];
     
-    const char *funcs[] = {"PKCS7_verify", "X509_verify_cert", "CMS_verify", "CMS_verify_receipt", NULL};
+    const char *funcs[] = {
+        "PKCS7_verify", "X509_verify_cert", "CMS_verify", "CMS_verify_receipt",
+        "RSA_verify", "EVP_VerifyFinal", "EVP_DigestVerifyFinal",
+        "ECDSA_verify", "DSA_verify", NULL
+    };
     
     for (int i = 0; funcs[i]; i++) {
         void *sym = dlsym(RTLD_DEFAULT, funcs[i]);

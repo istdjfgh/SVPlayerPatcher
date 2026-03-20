@@ -261,7 +261,12 @@ def patch_ipa(ipa_path):
         with open(libmpv_path, 'rb') as f:
             data = bytearray(f.read())
         
-        symbols = ['PKCS7_verify', 'X509_verify_cert', 'CMS_verify', 'CMS_verify_receipt']
+        symbols = [
+            'PKCS7_verify', 'X509_verify_cert', 'CMS_verify', 'CMS_verify_receipt',
+            'RSA_verify', 'EVP_VerifyFinal', 'EVP_DigestVerifyFinal',
+            'ECDSA_verify', 'DSA_verify', 'CMS_SignerInfo_verify',
+            'ASN1_item_verify', 'ASN1_verify',
+        ]
         patched = 0
         for sym in symbols:
             offset = find_symbol_offset(data, sym)
