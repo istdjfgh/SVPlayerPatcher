@@ -23,6 +23,7 @@ jobs:
             -dynamiclib \
             -framework Foundation \
             -framework UIKit \
+            -framework StoreKit \
             -lobjc \
             -o SVPlayerPatcher.dylib \
             Tweak.m \
