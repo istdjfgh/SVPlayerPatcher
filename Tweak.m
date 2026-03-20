@@ -453,20 +453,66 @@ static void tweak_init(void) {
     
     patchConfig(); // Patch NOW (before Qt init)
     
-    // Also keep re-patching every 500ms for 15 seconds (in case Qt overwrites)
+    // Make main.cfg READ-ONLY so Qt can't reset h/pid!
+    NSDictionary *roAttrs = @{NSFilePosixPermissions: @(0444)};
+    [[NSFileManager defaultManager] setAttributes:roAttrs ofItemAtPath:cfgPath error:nil];
+    [_log appendString:@"[CFG] Set read-only (0444) 🔒\n"];
+    
+    // Also keep checking - if Qt somehow writes, re-patch and re-lock
     for (int i = 1; i <= 30; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 500 * NSEC_PER_MSEC)), dispatch_get_global_queue(0, 0), ^{
             NSData *d = [NSData dataWithContentsOfFile:cfgPath];
             if (d) {
                 NSString *c = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
                 if (c && [c containsString:@"dummydummy"]) {
+                    // Make writable first, then patch, then lock again
+                    [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @(0644)}
+                                                     ofItemAtPath:cfgPath error:nil];
                     NSString *p = [c stringByReplacingOccurrencesOfString:@"\"dummydummy\""
                                                               withString:@"\"unlock0\""];
                     [p writeToFile:cfgPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-                    [_log appendFormat:@"[CFG] Re-patched at %dms ✅\n", i*500];
+                    [[NSFileManager defaultManager] setAttributes:roAttrs ofItemAtPath:cfgPath error:nil];
+                    [_log appendFormat:@"[CFG] Re-patched+locked at %dms ✅\n", i*500];
                 }
             }
         });
+    }
+    
+    // BLOCK svp-team.com API validation by hooking NSURLSession
+    {
+        Method dm = class_getInstanceMethod([NSURLSession class], @selector(dataTaskWithRequest:completionHandler:));
+        if (dm) {
+            static IMP _orig_task = NULL;
+            _orig_task = method_setImplementation(dm, imp_implementationWithBlock(
+                ^NSURLSessionDataTask*(id self, NSURLRequest *request, void (^completion)(NSData*, NSURLResponse*, NSError*)) {
+                    NSString *url = request.URL.absoluteString;
+                    if ([url containsString:@"svp-team.com"] || [url containsString:@"svpteam.com"]) {
+                        [_log appendFormat:@"[API] BLOCKED: %@\n", url];
+                        [UIPasteboard generalPasteboard].string = _log;
+                        
+                        // Return fake "valid" response
+                        NSDictionary *resp = @{@"status": @"ok", @"valid": @YES, @"licensed": @YES};
+                        NSData *body = [NSJSONSerialization dataWithJSONObject:resp options:0 error:nil];
+                        NSHTTPURLResponse *fakeResp = [[NSHTTPURLResponse alloc]
+                            initWithURL:request.URL statusCode:200 HTTPVersion:@"HTTP/1.1"
+                            headerFields:@{@"Content-Type": @"application/json"}];
+                        
+                        if (completion) {
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                completion(body, fakeResp, nil);
+                            });
+                        }
+                        // Return a dummy task
+                        NSURLRequest *dummy = [NSURLRequest requestWithURL:[NSURL URLWithString:@"about:blank"]];
+                        return ((NSURLSessionDataTask*(*)(id, SEL, NSURLRequest*, id))_orig_task)(
+                            self, @selector(dataTaskWithRequest:completionHandler:), dummy, nil);
+                    }
+                    return ((NSURLSessionDataTask*(*)(id, SEL, NSURLRequest*, id))_orig_task)(
+                        self, @selector(dataTaskWithRequest:completionHandler:), request, completion);
+                }
+            ));
+            [_log appendString:@"[OK] API block hook\n"];
+        }
     }
     
     [_log appendString:@"\n"];
