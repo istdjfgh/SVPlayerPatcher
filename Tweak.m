@@ -101,11 +101,23 @@ static void rebind_symbols(struct rebinding *rebindings, size_t count) {
         if (hdr->magic != MH_MAGIC_64) continue;
         
         const char *name = _dyld_get_image_name(i);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
         
-        // Only rebind in SVPlayer's own binary and frameworks (not system)
-        if (name && (strstr(name, "SVPlayer") || strstr(name, "/Frameworks/"))) {
-            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-            perform_rebinding((const struct mach_header_64 *)hdr, slide, rebindings, count);
+        // Log non-system images
+        if (name && !strstr(name, "/usr/lib/") && !strstr(name, "/System/")) {
+            [_log appendFormat:@"[IMG] %s\n", name];
+        }
+        
+        // Scan ALL images (some OpenSSL might be in a framework)
+        perform_rebinding((const struct mach_header_64 *)hdr, slide, rebindings, count);
+    }
+    
+    // Also log where PKCS7_verify actually lives
+    void *sym = dlsym(RTLD_DEFAULT, "PKCS7_verify");
+    if (sym) {
+        Dl_info info;
+        if (dladdr(sym, &info)) {
+            [_log appendFormat:@"[INFO] PKCS7_verify in: %s\n", info.dli_fname];
         }
     }
 }
