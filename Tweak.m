@@ -695,32 +695,47 @@ static void tweak_init(void) {
             free(props);
         }
         
-        // Search ALL classes for license-related properties
-        [_log appendString:@"\n=== License Properties ===\n"];
+        // === Qt Purchase Backend Scan ===
+        [_log appendString:@"\n=== Qt Backend Scan ===\n"];
         unsigned int classCount = 0;
         Class *classes = objc_copyClassList(&classCount);
         for (unsigned int i = 0; i < classCount; i++) {
             const char *name = class_getName(classes[i]);
             NSString *cn = [NSString stringWithUTF8String:name];
-            // Only check app classes
-            if (![cn hasPrefix:@"SVP"] && ![cn hasPrefix:@"InApp"] && ![cn containsString:@"SVPlayer"] &&
-                ![cn containsString:@"License"] && ![cn containsString:@"Purchase"] &&
+            // Only Qt/SVP/IAP classes
+            if (![cn containsString:@"AppStore"] && ![cn containsString:@"InApp"] &&
+                ![cn hasPrefix:@"SVP"] && ![cn containsString:@"Product"] &&
                 ![cn containsString:@"Backend"]) continue;
+            // Skip Apple/system classes
+            if ([cn hasPrefix:@"ASD"] || [cn hasPrefix:@"FC"] || [cn hasPrefix:@"Fig"] ||
+                [cn hasPrefix:@"LA"] || [cn hasPrefix:@"LS"] || [cn hasPrefix:@"BY"] ||
+                [cn hasPrefix:@"Cloud"] || [cn hasPrefix:@"Network"] ||
+                [cn hasPrefix:@"Sensitive"] || [cn hasPrefix:@"Managed"] ||
+                [cn hasPrefix:@"_Tt"] || [cn hasPrefix:@"StoreKit"]) continue;
             
-            [_log appendFormat:@"  CLASS: %@\n", cn];
+            [_log appendFormat:@"\n  CLASS: %@\n", cn];
             unsigned int pc = 0;
             objc_property_t *props = class_copyPropertyList(classes[i], &pc);
-            for (unsigned int j = 0; j < pc && j < 20; j++) {
-                [_log appendFormat:@"    P: %s\n", property_getName(props[j])];
+            for (unsigned int j = 0; j < pc; j++) {
+                [_log appendFormat:@"    P: %s = %s\n", property_getName(props[j]),
+                 property_getAttributes(props[j])];
             }
             free(props);
             
             unsigned int mc2 = 0;
             Method *methods2 = class_copyMethodList(classes[i], &mc2);
-            for (unsigned int j = 0; j < mc2 && j < 20; j++) {
+            for (unsigned int j = 0; j < mc2; j++) {
                 [_log appendFormat:@"    M: %s\n", sel_getName(method_getName(methods2[j]))];
             }
             free(methods2);
+            
+            unsigned int ic2 = 0;
+            Ivar *ivars2 = class_copyIvarList(classes[i], &ic2);
+            for (unsigned int j = 0; j < ic2; j++) {
+                [_log appendFormat:@"    I: %s (%s)\n", ivar_getName(ivars2[j]),
+                 ivar_getTypeEncoding(ivars2[j])];
+            }
+            free(ivars2);
         }
         free(classes);
         
