@@ -211,8 +211,114 @@ static void writeFakeReceipt(void) {
 }
 
 // ====================================================
-// PART 3: StoreKit hooks
+// PART 2b: Test d2i_PKCS7 with our receipt + dump main.cfg
 // ====================================================
+
+typedef void* (*d2i_PKCS7_t)(void**, const unsigned char**, long);
+typedef void (*PKCS7_free_t)(void*);
+
+static void testReceiptParsing(NSData *receipt) {
+    [_log appendString:@"=== d2i_PKCS7 Self-Test ===\n"];
+    
+    d2i_PKCS7_t d2i = (d2i_PKCS7_t)dlsym(RTLD_DEFAULT, "d2i_PKCS7");
+    PKCS7_free_t pfree = (PKCS7_free_t)dlsym(RTLD_DEFAULT, "PKCS7_free");
+    
+    if (!d2i) {
+        [_log appendString:@"  d2i_PKCS7: NOT FOUND\n"];
+        return;
+    }
+    
+    const unsigned char *ptr = receipt.bytes;
+    void *p7 = d2i(NULL, &ptr, (long)receipt.length);
+    
+    if (p7) {
+        [_log appendString:@"  d2i_PKCS7: PARSED OK ✅\n"];
+        
+        // Try PKCS7_verify on it
+        typedef int (*PKCS7_verify_t)(void*, void*, void*, void*, void*, int);
+        PKCS7_verify_t pv = (PKCS7_verify_t)dlsym(RTLD_DEFAULT, "PKCS7_verify");
+        if (pv) {
+            int r = pv(p7, NULL, NULL, NULL, NULL, 0x8); // PKCS7_NOVERIFY
+            [_log appendFormat:@"  PKCS7_verify result: %d %@\n", r, r == 1 ? @"✅" : @"❌"];
+        }
+        
+        if (pfree) pfree(p7);
+    } else {
+        [_log appendString:@"  d2i_PKCS7: PARSE FAILED ❌ (our ASN.1 is broken!)\n"];
+        [_log appendFormat:@"  Receipt hex (first 64): "];
+        const uint8_t *b = receipt.bytes;
+        for (int i = 0; i < 64 && i < (int)receipt.length; i++) {
+            [_log appendFormat:@"%02X", b[i]];
+        }
+        [_log appendString:@"\n"];
+    }
+    [_log appendString:@"\n"];
+}
+
+static void dumpMainCfg(void) {
+    [_log appendString:@"=== main.cfg ===\n"];
+    
+    NSString *dataDir = NSHomeDirectory();
+    NSFileManager *fm = [NSFileManager defaultManager];
+    
+    // Search for main.cfg
+    NSArray *searchPaths = @[
+        [dataDir stringByAppendingPathComponent:@"Library/Preferences"],
+        [dataDir stringByAppendingPathComponent:@"Library"],
+        [dataDir stringByAppendingPathComponent:@"Documents"],
+        dataDir,
+    ];
+    
+    for (NSString *dir in searchPaths) {
+        NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil];
+        for (NSString *item in items) {
+            if ([item containsString:@"main.cfg"] || [item containsString:@"svp.lic"] ||
+                [item containsString:@"com.svpteam"]) {
+                NSString *full = [dir stringByAppendingPathComponent:item];
+                [_log appendFormat:@"  Found: %@/%@\n", [dir lastPathComponent], item];
+                
+                // Read small files
+                NSData *d = [NSData dataWithContentsOfFile:full];
+                if (d && d.length < 2000) {
+                    NSString *content = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+                    if (content) {
+                        [_log appendFormat:@"  Content:\n%@\n", content];
+                    }
+                }
+            }
+        }
+    }
+    
+    // Also check bundle for config files
+    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
+    NSArray *bundleItems = [fm contentsOfDirectoryAtPath:bundlePath error:nil];
+    for (NSString *item in bundleItems) {
+        if ([item hasSuffix:@".cfg"] || [item hasSuffix:@".lic"] || [item hasSuffix:@".ini"]) {
+            [_log appendFormat:@"  Bundle: %@\n", item];
+            NSString *full = [bundlePath stringByAppendingPathComponent:item];
+            NSData *d = [NSData dataWithContentsOfFile:full];
+            if (d && d.length < 2000) {
+                NSString *c = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+                if (c) [_log appendFormat:@"%@\n", c];
+            }
+        }
+    }
+    
+    // Check NSUserDefaults for purchase-related keys
+    NSDictionary *defaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+    [_log appendString:@"\n=== UserDefaults (purchase keys) ===\n"];
+    for (NSString *key in defaults) {
+        NSString *lk = [key lowercaseString];
+        if ([lk containsString:@"purchase"] || [lk containsString:@"premium"] ||
+            [lk containsString:@"trial"] || [lk containsString:@"license"] ||
+            [lk containsString:@"unlock"] || [lk containsString:@"paid"] ||
+            [lk containsString:@"pro"] || [lk containsString:@"hfr"] ||
+            [lk containsString:@"h/pid"] || [lk containsString:@"h/uid"]) {
+            [_log appendFormat:@"  %@ = %@\n", key, defaults[key]];
+        }
+    }
+    [_log appendString:@"\n"];
+}
 
 static IMP _orig_txState = NULL;
 static NSInteger hooked_txState(id self, SEL _cmd) {
@@ -280,13 +386,20 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v23 DEBUG ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v24 DIAG ===\n\n"];
     
     // 1. Verify binary patches
     verifyPatch();
     
     // 2. Write fake receipt
     writeFakeReceipt();
+    
+    // 2b. Test receipt parsing with d2i_PKCS7
+    NSData *testReceipt = buildFakeReceipt([[NSBundle mainBundle] bundleIdentifier] ?: @"com.svpteam.svp");
+    testReceiptParsing(testReceipt);
+    
+    // 2c. Dump config files
+    dumpMainCfg();
     
     // 3. Hook receiptURL
     Method m = class_getInstanceMethod([NSBundle class], @selector(appStoreReceiptURL));
