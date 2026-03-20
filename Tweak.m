@@ -1,198 +1,204 @@
-// SVPlayerPatcher v10c - Minimal safe hooks
+// SVPlayerPatcher v11 - FINAL: Fake successful purchase for hfr.m.y
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <StoreKit/StoreKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-static UIWindow *_overlayWindow = nil;
 static NSMutableString *_log = nil;
-static id _iapManager = nil;
+static BOOL _fakeState = NO;
 
-// === Hook 1: Capture observer - NO ivar reading ===
-static IMP _orig_addObserver = NULL;
+// === Fake transactionState: return "Restored" (3) ===
+static IMP _orig_txState = NULL;
 
-static void hooked_addObserver(id self, SEL _cmd, id observer) {
-    NSString *cn = NSStringFromClass([observer class]);
-    [_log appendFormat:@"[CAPTURE] %@\n", cn];
-    if ([cn isEqualToString:@"InAppPurchaseManager"]) {
-        _iapManager = observer;
+static NSInteger hooked_txState(id self, SEL _cmd) {
+    if (_fakeState) {
+        return SKPaymentTransactionStateRestored; // 3 = restored
     }
-    ((void(*)(id, SEL, id))_orig_addObserver)(self, _cmd, observer);
+    return ((NSInteger(*)(id, SEL))_orig_txState)(self, _cmd);
 }
 
-// === Hook 2: updatedTransactions ===
+// === Fake transactionIdentifier ===
+static IMP _orig_txId = NULL;
+
+static NSString* hooked_txId(id self, SEL _cmd) {
+    if (_fakeState) {
+        return @"2000000845671234";
+    }
+    return ((NSString*(*)(id, SEL))_orig_txId)(self, _cmd);
+}
+
+// === Fake transactionDate ===
+static IMP _orig_txDate = NULL;
+
+static NSDate* hooked_txDate(id self, SEL _cmd) {
+    if (_fakeState) {
+        return [NSDate date];
+    }
+    return ((NSDate*(*)(id, SEL))_orig_txDate)(self, _cmd);
+}
+
+// === Fake originalTransaction (for restores) ===
+static IMP _orig_origTx = NULL;
+
+static id hooked_origTx(id self, SEL _cmd) {
+    if (_fakeState) {
+        return self; // point to self
+    }
+    return ((id(*)(id, SEL))_orig_origTx)(self, _cmd);
+}
+
+// === Hook paymentQueue:updatedTransactions: ===
 static IMP _orig_updated = NULL;
 
 static void hooked_updated(id self, SEL _cmd, id queue, NSArray *txs) {
-    [_log appendFormat:@"\n[TX] %lu transactions:\n", (unsigned long)txs.count];
+    [_log appendFormat:@"\n[TX] %lu txs:\n", (unsigned long)txs.count];
+    
+    BOOL hasTarget = NO;
     for (SKPaymentTransaction *tx in txs) {
-        [_log appendFormat:@"  state=%ld prod=%@ id=%@\n",
-         (long)tx.transactionState, tx.payment.productIdentifier, tx.transactionIdentifier];
+        NSString *pid = tx.payment.productIdentifier;
+        [_log appendFormat:@"  state=%ld prod=%@\n", (long)tx.transactionState, pid];
+        
+        if ([pid isEqualToString:@"hfr.m.y"]) {
+            hasTarget = YES;
+        }
     }
+    
+    if (hasTarget) {
+        [_log appendString:@"[PATCH] Faking state -> Restored!\n"];
+        
+        // Enable fake state
+        _fakeState = YES;
+        
+        // Call original - it will see state=3 (restored) instead of state=2 (failed)
+        ((void(*)(id, SEL, id, NSArray*))_orig_updated)(self, _cmd, queue, txs);
+        
+        // Disable fake state
+        _fakeState = NO;
+        
+        [_log appendString:@"[PATCH] Done! Check if premium activated.\n"];
+    } else {
+        ((void(*)(id, SEL, id, NSArray*))_orig_updated)(self, _cmd, queue, txs);
+    }
+    
     [UIPasteboard generalPasteboard].string = _log;
-    ((void(*)(id, SEL, id, NSArray*))_orig_updated)(self, _cmd, queue, txs);
 }
 
-// === Hook 3: products response ===
-static IMP _orig_products = NULL;
+// === Hook finishTransaction to not crash ===
+static IMP _orig_finish = NULL;
 
+static void hooked_finish(id self, SEL _cmd, SKPaymentTransaction *tx) {
+    [_log appendFormat:@"[FINISH] prod=%@ state=%ld\n", tx.payment.productIdentifier, (long)tx.transactionState];
+    @try {
+        ((void(*)(id, SEL, SKPaymentTransaction*))_orig_finish)(self, _cmd, tx);
+    } @catch (NSException *e) {
+        [_log appendFormat:@"[FINISH] caught: %@\n", e.reason];
+    }
+}
+
+// === Hook restoreFinished ===
+static IMP _orig_restored = NULL;
+static void hooked_restored(id self, SEL _cmd, id q) {
+    [_log appendString:@"[RESTORE] Finished\n"];
+    [UIPasteboard generalPasteboard].string = _log;
+    ((void(*)(id, SEL, id))_orig_restored)(self, _cmd, q);
+}
+
+// === Hook products response ===
+static IMP _orig_products = NULL;
 static void hooked_products(id self, SEL _cmd, id req, SKProductsResponse *resp) {
-    [_log appendString:@"\n[PRODUCTS]\n"];
+    [_log appendString:@"[PRODUCTS]\n"];
     for (SKProduct *p in resp.products) {
-        [_log appendFormat:@"  %@ (%@) %@\n", p.productIdentifier, p.localizedTitle, p.price];
+        [_log appendFormat:@"  %@ price=%@\n", p.productIdentifier, p.price];
     }
     [UIPasteboard generalPasteboard].string = _log;
     ((void(*)(id, SEL, id, SKProductsResponse*))_orig_products)(self, _cmd, req, resp);
 }
 
-// === Hook 4: restore finished ===
-static IMP _orig_restored = NULL;
-static void hooked_restored(id self, SEL _cmd, id q) {
-    [_log appendString:@"\n[RESTORE] Done\n"];
-    [UIPasteboard generalPasteboard].string = _log;
-    ((void(*)(id, SEL, id))_orig_restored)(self, _cmd, q);
-}
-
-// === Hook 5: network ===
-static IMP _orig_task = NULL;
-static id hooked_task(id self, SEL _cmd, NSURLRequest *req, void(^comp)(NSData*, NSURLResponse*, NSError*)) {
-    NSString *u = req.URL.absoluteString;
-    if ([u containsString:@"svp"] || [u containsString:@"apple.com"] || [u containsString:@"itunes"]) {
-        [_log appendFormat:@"[NET] %@\n", u];
-    }
-    return ((id(*)(id, SEL, NSURLRequest*, void(^)(NSData*, NSURLResponse*, NSError*)))_orig_task)(self, _cmd, req, comp);
-}
-
-// Safely dump InAppPurchaseManager (called with delay)
-static void dumpIAPManager(void) {
-    if (!_iapManager) {
-        [_log appendString:@"[FAIL] No IAP manager captured\n"];
-        return;
-    }
-    
-    Class cls = [_iapManager class];
-    [_log appendFormat:@"\n=== InAppPurchaseManager dump ===\n"];
-    
-    // Methods (safe - class metadata)
-    unsigned int mc = 0;
-    Method *methods = class_copyMethodList(cls, &mc);
-    [_log appendFormat:@"Methods (%d):\n", mc];
-    for (unsigned int i = 0; i < mc; i++) {
-        [_log appendFormat:@"  %@\n", NSStringFromSelector(method_getName(methods[i]))];
-    }
-    if (methods) free(methods);
-    
-    // Properties (safe - class metadata) + KVC reads
-    unsigned int pc = 0;
-    objc_property_t *props = class_copyPropertyList(cls, &pc);
-    NSMutableArray *propNames = [NSMutableArray array];
-    [_log appendFormat:@"\nProperties (%d):\n", pc];
-    for (unsigned int i = 0; i < pc; i++) {
-        NSString *pn = [NSString stringWithUTF8String:property_getName(props[i])];
-        [propNames addObject:pn];
-        [_log appendFormat:@"  %@\n", pn];
-    }
-    if (props) free(props);
-    
-    // Read property values via KVC
-    [_log appendString:@"\nKVC values:\n"];
-    for (NSString *pn in propNames) {
-        @try {
-            id val = [_iapManager valueForKey:pn];
-            NSString *desc = [val description];
-            if (desc.length > 100) desc = [[desc substringToIndex:100] stringByAppendingString:@"..."];
-            [_log appendFormat:@"  %@ = %@\n", pn, desc];
-        } @catch (NSException *e) {
-            [_log appendFormat:@"  %@ = <err>\n", pn];
-        }
-    }
-    
-    // Ivar names only (don't read values)
-    unsigned int ic = 0;
-    Ivar *ivars = class_copyIvarList(cls, &ic);
-    [_log appendFormat:@"\nIvars (%d):\n", ic];
-    for (unsigned int i = 0; i < ic; i++) {
-        const char *n = ivar_getName(ivars[i]);
-        const char *t = ivar_getTypeEncoding(ivars[i]);
-        [_log appendFormat:@"  %s (%s)\n", n, t ? t : "?"];
-    }
-    if (ivars) free(ivars);
+static void patchConfig(void) {
+    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:
+                   @"Library/Application Support/SVPlayer/settings/main.cfg"];
+    NSData *d = [NSData dataWithContentsOfFile:p];
+    if (!d) return;
+    NSMutableDictionary *c = [NSJSONSerialization JSONObjectWithData:d
+                              options:NSJSONReadingMutableContainers error:nil];
+    if (!c) return;
+    c[@"h/pid"] = @"2000000845671234";
+    c[@"h/last_check"] = @(1893456000);
+    NSData *n = [NSJSONSerialization dataWithJSONObject:c options:NSJSONWritingPrettyPrinted error:nil];
+    [n writeToFile:p atomically:YES];
+    [_log appendString:@"[OK] cfg patched\n"];
 }
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v10c ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v11 FINAL ===\n\n"];
     
-    // Hook addTransactionObserver
-    Method m = class_getInstanceMethod([SKPaymentQueue class], @selector(addTransactionObserver:));
-    if (m) { _orig_addObserver = method_setImplementation(m, (IMP)hooked_addObserver); [_log appendString:@"[OK] Hook observer\n"]; }
+    // Hook SKPaymentTransaction getters
+    Method m;
+    m = class_getInstanceMethod([SKPaymentTransaction class], @selector(transactionState));
+    if (m) { _orig_txState = method_setImplementation(m, (IMP)hooked_txState); [_log appendString:@"[OK] Hook txState\n"]; }
     
-    // Hook NSURLSession
-    m = class_getInstanceMethod([NSURLSession class], @selector(dataTaskWithRequest:completionHandler:));
-    if (m) { _orig_task = method_setImplementation(m, (IMP)hooked_task); [_log appendString:@"[OK] Hook net\n"]; }
+    m = class_getInstanceMethod([SKPaymentTransaction class], @selector(transactionIdentifier));
+    if (m) { _orig_txId = method_setImplementation(m, (IMP)hooked_txId); [_log appendString:@"[OK] Hook txId\n"]; }
     
-    // Delayed: hook IAP methods + dump
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    m = class_getInstanceMethod([SKPaymentTransaction class], @selector(transactionDate));
+    if (m) { _orig_txDate = method_setImplementation(m, (IMP)hooked_txDate); [_log appendString:@"[OK] Hook txDate\n"]; }
+    
+    m = class_getInstanceMethod([SKPaymentTransaction class], @selector(originalTransaction));
+    if (m) { _orig_origTx = method_setImplementation(m, (IMP)hooked_origTx); [_log appendString:@"[OK] Hook origTx\n"]; }
+    
+    // Hook SKPaymentQueue finishTransaction:
+    m = class_getInstanceMethod([SKPaymentQueue class], @selector(finishTransaction:));
+    if (m) { _orig_finish = method_setImplementation(m, (IMP)hooked_finish); [_log appendString:@"[OK] Hook finish\n"]; }
+    
+    patchConfig();
+    
+    // Delayed hooks for InAppPurchaseManager
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         Class cls = NSClassFromString(@"InAppPurchaseManager");
-        if (cls) {
-            Method m2 = class_getInstanceMethod(cls, @selector(paymentQueue:updatedTransactions:));
-            if (m2) { _orig_updated = method_setImplementation(m2, (IMP)hooked_updated); [_log appendString:@"[OK] Hook tx\n"]; }
-            
-            Method m3 = class_getInstanceMethod(cls, @selector(productsRequest:didReceiveResponse:));
-            if (m3) { _orig_products = method_setImplementation(m3, (IMP)hooked_products); [_log appendString:@"[OK] Hook prod\n"]; }
-            
-            Method m4 = class_getInstanceMethod(cls, @selector(paymentQueueRestoreCompletedTransactionsFinished:));
-            if (m4) { _orig_restored = method_setImplementation(m4, (IMP)hooked_restored); [_log appendString:@"[OK] Hook restore\n"]; }
-        }
+        if (!cls) { [_log appendString:@"[FAIL] No IAP class\n"]; return; }
         
-        dumpIAPManager();
+        Method m2 = class_getInstanceMethod(cls, @selector(paymentQueue:updatedTransactions:));
+        if (m2) { _orig_updated = method_setImplementation(m2, (IMP)hooked_updated); [_log appendString:@"[OK] Hook tx\n"]; }
+        
+        Method m3 = class_getInstanceMethod(cls, @selector(productsRequest:didReceiveResponse:));
+        if (m3) { _orig_products = method_setImplementation(m3, (IMP)hooked_products); [_log appendString:@"[OK] Hook prod\n"]; }
+        
+        Method m4 = class_getInstanceMethod(cls, @selector(paymentQueueRestoreCompletedTransactionsFinished:));
+        if (m4) { _orig_restored = method_setImplementation(m4, (IMP)hooked_restored); [_log appendString:@"[OK] Hook restore\n"]; }
         
         [UIPasteboard generalPasteboard].string = _log;
         
-        // Show overlay
+        // Brief status overlay (3 seconds only!)
         UIWindowScene *scene = nil;
         for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) { scene = s; break; }
         if (!scene) return;
         
-        _overlayWindow = [[UIWindow alloc] initWithWindowScene:scene];
-        _overlayWindow.frame = scene.coordinateSpace.bounds;
-        _overlayWindow.windowLevel = UIWindowLevelAlert + 100;
-        _overlayWindow.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.92];
-        _overlayWindow.rootViewController = [[UIViewController alloc] init];
-        CGRect b = _overlayWindow.bounds;
+        UIWindow *w = [[UIWindow alloc] initWithWindowScene:scene];
+        w.frame = CGRectMake(20, 40, 400, 35);
+        w.windowLevel = UIWindowLevelAlert + 100;
+        w.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.8];
+        w.layer.cornerRadius = 10;
+        w.clipsToBounds = YES;
+        w.rootViewController = [[UIViewController alloc] init];
+        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(10, 0, 380, 35)];
+        l.text = @"✅ v11 ready - tap Restore now!";
+        l.textColor = [UIColor greenColor];
+        l.font = [UIFont boldSystemFontOfSize:14];
+        [w.rootViewController.view addSubview:l];
+        w.hidden = NO;
+        [w makeKeyAndVisible];
         
-        UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(20, 50, b.size.width - 40, 30)];
-        t.text = @"v10c OK - close this, tap Restore, paste log";
-        t.textColor = [UIColor cyanColor];
-        t.font = [UIFont boldSystemFontOfSize:13];
-        [_overlayWindow.rootViewController.view addSubview:t];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            w.hidden = YES;
+        });
         
-        UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(10, 85, b.size.width - 20, b.size.height - 95)];
-        tv.text = _log;
-        tv.font = [UIFont fontWithName:@"Menlo" size:10];
-        tv.textColor = [UIColor greenColor];
-        tv.backgroundColor = [UIColor clearColor];
-        tv.editable = NO;
-        tv.tag = 999;
-        [_overlayWindow.rootViewController.view addSubview:tv];
-        
-        _overlayWindow.hidden = NO;
-        [_overlayWindow makeKeyAndVisible];
-        
-        // Update log periodically
-        for (int i = 1; i <= 20; i++) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                UITextView *lv = (UITextView*)[_overlayWindow.rootViewController.view viewWithTag:999];
-                if (lv) lv.text = _log;
+        // Keep updating clipboard with log
+        for (int i = 1; i <= 30; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 [UIPasteboard generalPasteboard].string = _log;
             });
         }
-        
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [UIPasteboard generalPasteboard].string = _log;
-            _overlayWindow.hidden = YES;
-            _overlayWindow = nil;
-        });
     });
 }
