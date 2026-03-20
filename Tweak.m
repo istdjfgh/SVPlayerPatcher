@@ -1,172 +1,343 @@
-// SVPlayerPatcher v22 - Targeted symbol search in libmpv + main binary
+// SVPlayerPatcher v23 - Debug + fake receipt writer (USE WITH PATCHED IPA)
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <StoreKit/StoreKit.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
-#import <mach-o/dyld.h>
-#import <mach-o/loader.h>
-#import <mach-o/nlist.h>
-#import <string.h>
 
 static NSMutableString *_log = nil;
 static BOOL _fakeState = NO;
 
-// Known OpenSSL prefixes to SKIP
-static BOOL isOpenSSLSymbol(const char *name) {
-    const char *prefixes[] = {
-        "ASN1_", "BIO_", "BN_", "CMS_", "CRYPTO_", "CT_", "DES_", "DH_", "DSA_",
-        "ECDH_", "ECDSA_", "EC_", "ED25519", "ED448", "ENGINE_", "ERR_", "EVP_",
-        "HMAC_", "MD5_", "OBJ_", "OCSP_", "OPENSSL_", "PEM_", "PKCS", "RAND_",
-        "RSA_", "SHA", "SSL_", "TLS_", "TS_", "UI_", "X509", "X25519", "X448",
-        "AES_", "BF_", "CAST_", "Camellia_", "GENERAL_", "NAMING_", "NCONF_",
-        "NETSCAPE_", "OSSL_", "ADMISS", "AUTHOR", "BASIC_", "CERTIFICAT",
-        "COMP_", "CONF_", "DER_", "DIRECTORYSTRING", "DISPLAYTEXT",
-        "DIST_", "ESS_", "EXT_", "GENERAL_", "IDEA_", "IPAddress",
-        "ISSUING_", "KRB5", "LHASH_", "NIST_", "NID_", "NOTICEREF",
-        "OTHERNAME", "POLICY", "PROFESSION", "RC", "SEED_", "SMIME_",
-        "SRP_", "SXNET", "TXT_DB", "USERNOTICE", "WHIRLPOOL", "a2i_", "b2i_",
-        "i2a_", "i2b_", "i2d_", "d2i_", "i2o_", "o2i_", "i2s_", "s2i_",
-        "i2t_", "i2v_", "v2i_",
-        NULL
-    };
-    for (int i = 0; prefixes[i]; i++) {
-        if (strncmp(name, prefixes[i], strlen(prefixes[i])) == 0) return YES;
+// ====================================================
+// PART 1: Verify binary patch + scan crypto
+// ====================================================
+
+static void verifyPatch(void) {
+    [_log appendString:@"=== Patch Verification ===\n"];
+    
+    const char *funcs[] = {"PKCS7_verify", "X509_verify_cert", "CMS_verify", "CMS_verify_receipt", NULL};
+    
+    for (int i = 0; funcs[i]; i++) {
+        void *sym = dlsym(RTLD_DEFAULT, funcs[i]);
+        if (!sym) {
+            [_log appendFormat:@"  %s: NOT FOUND\n", funcs[i]];
+            continue;
+        }
+        
+        uint32_t *fn = (uint32_t *)sym;
+        // Check if patched: MOV W0, #1 (0x52800020) + RET (0xD65F03C0)
+        BOOL patched = (fn[0] == 0x52800020 && fn[1] == 0xD65F03C0);
+        [_log appendFormat:@"  %s: %s [%08X %08X]\n",
+         funcs[i],
+         patched ? "PATCHED ✅" : "NOT PATCHED ❌",
+         fn[0], fn[1]];
     }
-    return NO;
+    [_log appendString:@"\n"];
 }
 
-static void dumpImageSymbols(const char *targetImage) {
-    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
-        const char *imgName = _dyld_get_image_name(i);
-        if (!imgName || !strstr(imgName, targetImage)) continue;
-        
-        const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(i);
-        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-        
-        struct symtab_command *symtab = NULL;
-        struct segment_command_64 *linkedit = NULL;
-        struct load_command *cmd = (struct load_command *)((char *)header + sizeof(struct mach_header_64));
-        
-        for (uint32_t j = 0; j < header->ncmds; j++) {
-            if (cmd->cmd == LC_SYMTAB) symtab = (struct symtab_command *)cmd;
-            if (cmd->cmd == LC_SEGMENT_64) {
-                struct segment_command_64 *seg = (struct segment_command_64 *)cmd;
-                if (strcmp(seg->segname, SEG_LINKEDIT) == 0) linkedit = seg;
-            }
-            cmd = (struct load_command *)((char *)cmd + cmd->cmdsize);
+// ====================================================
+// PART 2: Build and write fake receipt to DATA container
+// ====================================================
+
+// Minimal ASN.1 DER helpers
+static NSMutableData *asn1Tag(uint8_t tag, NSData *content) {
+    NSMutableData *d = [NSMutableData data];
+    [d appendBytes:&tag length:1];
+    NSUInteger len = content.length;
+    if (len < 0x80) {
+        uint8_t b = (uint8_t)len;
+        [d appendBytes:&b length:1];
+    } else if (len < 0x100) {
+        uint8_t b[] = {0x81, (uint8_t)len};
+        [d appendBytes:b length:2];
+    } else {
+        uint8_t b[] = {0x82, (uint8_t)(len >> 8), (uint8_t)(len & 0xFF)};
+        [d appendBytes:b length:3];
+    }
+    [d appendData:content];
+    return d;
+}
+
+static NSData *asn1Seq(NSData *c) { return asn1Tag(0x30, c); }
+static NSData *asn1Set(NSData *c) { return asn1Tag(0x31, c); }
+static NSData *asn1Octet(NSData *c) { return asn1Tag(0x04, c); }
+
+static NSData *asn1Int(int val) {
+    if (val < 0x80) {
+        uint8_t b = (uint8_t)val;
+        return asn1Tag(0x02, [NSData dataWithBytes:&b length:1]);
+    }
+    uint8_t b[] = {0x00, (uint8_t)val};
+    return asn1Tag(0x02, [NSData dataWithBytes:b length:2]);
+}
+
+static NSData *asn1IntBig(int val) {
+    // For values > 255 (like 1701, 1702)
+    uint8_t b[3];
+    if (val < 0x80) {
+        b[0] = val; return asn1Tag(0x02, [NSData dataWithBytes:b length:1]);
+    } else if (val < 0x100) {
+        b[0] = 0; b[1] = val; return asn1Tag(0x02, [NSData dataWithBytes:b length:2]);
+    } else {
+        b[0] = (val >> 8) & 0xFF; b[1] = val & 0xFF;
+        if (b[0] >= 0x80) {
+            uint8_t c[] = {0, b[0], b[1]};
+            return asn1Tag(0x02, [NSData dataWithBytes:c length:3]);
         }
-        if (!symtab || !linkedit) return;
-        
-        uintptr_t base = (uintptr_t)slide + linkedit->vmaddr - linkedit->fileoff;
-        struct nlist_64 *syms = (struct nlist_64 *)(base + symtab->symoff);
-        char *strs = (char *)(base + symtab->stroff);
-        
-        [_log appendFormat:@"\n=== %s (%d syms) ===\n", targetImage, symtab->nsyms];
-        
-        // Search 1: SVP-specific keywords (not prefixed by OpenSSL)
-        const char *keys[] = {"svp", "hfr", "licen", "premium", "trial",
-                              "unlock", "purchas", "subscribe", "iap", "paid", NULL};
-        
-        int found = 0;
-        for (uint32_t s = 0; s < symtab->nsyms; s++) {
-            if (syms[s].n_value == 0) continue;
-            char *name = strs + syms[s].n_un.n_strx;
-            if (name[0] == '_') name++;
-            if (isOpenSSLSymbol(name)) continue;
-            
-            char lower[512];
-            size_t len = strlen(name);
-            if (len >= 512) len = 511;
-            for (size_t c = 0; c < len; c++)
-                lower[c] = (name[c] >= 'A' && name[c] <= 'Z') ? name[c]+32 : name[c];
-            lower[len] = 0;
-            
-            for (int k = 0; keys[k]; k++) {
-                if (strstr(lower, keys[k])) {
-                    void *addr = (void *)(syms[s].n_value + slide);
-                    [_log appendFormat:@"  %s @ %p\n", name, addr];
-                    found++;
-                    break;
-                }
-            }
-        }
-        
-        // Search 2: ALL non-OpenSSL, non-system exported symbols (first 100)
-        if (found == 0) {
-            [_log appendString:@"\n--- Non-OpenSSL exports (first 100) ---\n"];
-            int cnt = 0;
-            for (uint32_t s = 0; s < symtab->nsyms && cnt < 100; s++) {
-                if ((syms[s].n_type & N_EXT) == 0) continue;
-                if (syms[s].n_value == 0) continue;
-                char *name = strs + syms[s].n_un.n_strx;
-                if (name[0] == '_') name++;
-                if (isOpenSSLSymbol(name)) continue;
-                if (strlen(name) < 3) continue;
-                // Skip more crypto
-                if (strstr(name, "OPENSSL") || strstr(name, "ssl") || strstr(name, "SHA")
-                    || strstr(name, "AES") || strstr(name, "DES")) continue;
-                
-                [_log appendFormat:@"  %s\n", name];
-                cnt++;
-            }
-        }
-        
-        [_log appendFormat:@"\nFound %d matching\n", found];
-        break;
+        return asn1Tag(0x02, [NSData dataWithBytes:b length:2]);
     }
 }
 
-// StoreKit hooks (minimal)
+static NSData *asn1Utf8(NSString *s) {
+    return asn1Tag(0x0C, [s dataUsingEncoding:NSUTF8StringEncoding]);
+}
+static NSData *asn1IA5(NSString *s) {
+    return asn1Tag(0x16, [s dataUsingEncoding:NSASCIIStringEncoding]);
+}
+static NSData *asn1Ctx(uint8_t num, NSData *c) {
+    return asn1Tag(0xA0 | num, c);
+}
+
+static NSData *asn1OID(const uint8_t *bytes, int len) {
+    return asn1Tag(0x06, [NSData dataWithBytes:bytes length:len]);
+}
+
+static NSData *receiptAttr(int type, NSData *val) {
+    NSMutableData *d = [NSMutableData data];
+    [d appendData:asn1IntBig(type)];
+    [d appendData:asn1Int(1)];
+    [d appendData:asn1Octet(val)];
+    return asn1Seq(d);
+}
+
+static NSData *buildFakeReceipt(NSString *bundleId) {
+    // IAP receipt for unlock0
+    NSMutableData *iap1 = [NSMutableData data];
+    [iap1 appendData:receiptAttr(1701, asn1Int(1))];           // quantity
+    [iap1 appendData:receiptAttr(1702, asn1Utf8(@"unlock0"))]; // product_id
+    [iap1 appendData:receiptAttr(1703, asn1Utf8(@"200000084567"))]; // tx_id
+    [iap1 appendData:receiptAttr(1704, asn1IA5(@"2025-01-15T10:00:00Z"))]; // date
+    [iap1 appendData:receiptAttr(1705, asn1Utf8(@"200000084567"))]; // orig_tx
+    [iap1 appendData:receiptAttr(1706, asn1IA5(@"2025-01-15T10:00:00Z"))]; // orig_date
+    
+    // IAP receipt for hfr.m.y (subscription - expires far future)
+    NSMutableData *iap2 = [NSMutableData data];
+    [iap2 appendData:receiptAttr(1701, asn1Int(1))];
+    [iap2 appendData:receiptAttr(1702, asn1Utf8(@"hfr.m.y"))];
+    [iap2 appendData:receiptAttr(1703, asn1Utf8(@"200000084568"))];
+    [iap2 appendData:receiptAttr(1704, asn1IA5(@"2025-01-15T10:00:00Z"))];
+    [iap2 appendData:receiptAttr(1705, asn1Utf8(@"200000084568"))];
+    [iap2 appendData:receiptAttr(1706, asn1IA5(@"2025-01-15T10:00:00Z"))];
+    [iap2 appendData:receiptAttr(1708, asn1IA5(@"2099-12-31T23:59:59Z"))]; // expires
+    
+    // Main receipt
+    NSMutableData *payload = [NSMutableData data];
+    [payload appendData:receiptAttr(2, asn1Utf8(bundleId))];     // bundle_id
+    [payload appendData:receiptAttr(3, asn1Utf8(@"1.8.0"))];     // version
+    [payload appendData:receiptAttr(4, asn1Octet([NSMutableData dataWithLength:16]))]; // opaque
+    [payload appendData:receiptAttr(5, asn1Octet([NSMutableData dataWithLength:20]))]; // sha1
+    [payload appendData:receiptAttr(12, asn1IA5(@"2025-01-15T10:00:00Z"))]; // creation
+    [payload appendData:receiptAttr(17, asn1Set(iap1))];         // IAP unlock0
+    [payload appendData:receiptAttr(17, asn1Set(iap2))];         // IAP hfr.m.y
+    [payload appendData:receiptAttr(19, asn1Utf8(@"1.0"))];      // orig version
+    
+    NSData *payloadSet = asn1Set(payload);
+    
+    // PKCS7 OIDs
+    uint8_t oidSD[] = {0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02}; // 1.2.840.113549.1.7.2
+    uint8_t oidData[] = {0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01}; // 1.2.840.113549.1.7.1
+    uint8_t oidSha[] = {0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01}; // 2.16.840.1.101.3.4.2.1
+    
+    // ContentInfo
+    NSMutableData *ci = [NSMutableData data];
+    [ci appendData:asn1OID(oidData, 9)];
+    [ci appendData:asn1Ctx(0, asn1Octet(payloadSet))];
+    
+    // SignedData
+    NSMutableData *sd = [NSMutableData data];
+    [sd appendData:asn1Int(1)];                        // version
+    [sd appendData:asn1Set(asn1Seq(asn1OID(oidSha, 9)))]; // digest algos
+    [sd appendData:asn1Seq(ci)];                       // content info
+    [sd appendData:asn1Set([NSData data])];             // signer infos (empty)
+    
+    // PKCS7 wrapper
+    NSMutableData *p7 = [NSMutableData data];
+    [p7 appendData:asn1OID(oidSD, 9)];
+    [p7 appendData:asn1Ctx(0, asn1Seq(sd))];
+    
+    return asn1Seq(p7);
+}
+
+static void writeFakeReceipt(void) {
+    [_log appendString:@"=== Receipt Generation ===\n"];
+    
+    // Get bundle ID
+    NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier] ?: @"hfr.m.svplayer";
+    [_log appendFormat:@"  Bundle ID: %@\n", bundleId];
+    
+    NSData *receipt = buildFakeReceipt(bundleId);
+    [_log appendFormat:@"  Receipt size: %lu bytes\n", (unsigned long)receipt.length];
+    
+    // Write to where iOS stores receipts
+    NSString *receiptPath = [[[NSBundle mainBundle] appStoreReceiptURL] path];
+    [_log appendFormat:@"  Receipt URL: %@\n", receiptPath ?: @"nil"];
+    
+    if (receiptPath) {
+        NSString *dir = [receiptPath stringByDeletingLastPathComponent];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        BOOL ok = [receipt writeToFile:receiptPath atomically:YES];
+        [_log appendFormat:@"  Write to receiptURL: %@\n", ok ? @"OK ✅" : @"FAIL ❌"];
+    }
+    
+    // Also write to common receipt locations
+    NSString *dataDir = NSHomeDirectory();
+    NSArray *paths = @[
+        [dataDir stringByAppendingPathComponent:@"StoreKit/sandboxReceipt"],
+        [dataDir stringByAppendingPathComponent:@"StoreKit/receipt"],
+    ];
+    for (NSString *p in paths) {
+        NSString *dir = [p stringByDeletingLastPathComponent];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        BOOL ok = [receipt writeToFile:p atomically:YES];
+        [_log appendFormat:@"  %@: %@\n", [p lastPathComponent], ok ? @"OK ✅" : @"FAIL ❌"];
+    }
+    [_log appendString:@"\n"];
+}
+
+// ====================================================
+// PART 3: StoreKit hooks
+// ====================================================
+
 static IMP _orig_txState = NULL;
 static NSInteger hooked_txState(id self, SEL _cmd) {
     if (_fakeState) return SKPaymentTransactionStateRestored;
     return ((NSInteger(*)(id, SEL))_orig_txState)(self, _cmd);
 }
+static IMP _orig_origTx = NULL;
+static id hooked_origTx(id self, SEL _cmd) {
+    if (_fakeState) return self;
+    return ((id(*)(id, SEL))_orig_origTx)(self, _cmd);
+}
+static IMP _orig_txId = NULL;
+static NSString* hooked_txId(id self, SEL _cmd) {
+    if (_fakeState) return @"200000084567";
+    return ((NSString*(*)(id, SEL))_orig_txId)(self, _cmd);
+}
+
+static IMP _orig_updated = NULL;
+static void hooked_updated(id self, SEL _cmd, id queue, NSArray *txs) {
+    for (SKPaymentTransaction *tx in txs) {
+        NSInteger real = ((NSInteger(*)(id, SEL))_orig_txState)(tx, @selector(transactionState));
+        [_log appendFormat:@"[TX] state=%ld prod=%@\n", (long)real, tx.payment.productIdentifier];
+    }
+    _fakeState = YES;
+    [_log appendString:@"[FAKE] state -> Restored\n"];
+    ((void(*)(id, SEL, id, NSArray*))_orig_updated)(self, _cmd, queue, txs);
+    _fakeState = NO;
+    [UIPasteboard generalPasteboard].string = _log;
+}
+
+static IMP _orig_finish = NULL;
+static void hooked_finish(id s, SEL c, id tx) {
+    [_log appendString:@"[FINISH] tx\n"];
+    @try { ((void(*)(id,SEL,id))_orig_finish)(s,c,tx); } @catch(NSException *e) {}
+}
+static IMP _orig_restored = NULL;
+static void hooked_restored(id s, SEL c, id q) {
+    [_log appendString:@"[RESTORE] completed\n"];
+    [UIPasteboard generalPasteboard].string = _log;
+    ((void(*)(id,SEL,id))_orig_restored)(s,c,q);
+}
+
+// ====================================================
+// PART 4: Hook receipt URL to return our receipt
+// ====================================================
+
+static IMP _orig_receiptURL = NULL;
+static NSURL* hooked_receiptURL(id self, SEL _cmd) {
+    // Point to our fake receipt
+    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"StoreKit/sandboxReceipt"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
+        [_log appendString:@"[RECEIPT] -> fake receipt\n"];
+        return [NSURL fileURLWithPath:p];
+    }
+    return ((NSURL*(*)(id, SEL))_orig_receiptURL)(self, _cmd);
+}
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v22 ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v23 DEBUG ===\n\n"];
     
-    // Dump BOTH images
-    dumpImageSymbols("SVPlayer.app/SVPlayer");
-    dumpImageSymbols("libmpv");
+    // 1. Verify binary patches
+    verifyPatch();
     
-    Method m = class_getInstanceMethod([SKPaymentTransaction class], @selector(transactionState));
+    // 2. Write fake receipt
+    writeFakeReceipt();
+    
+    // 3. Hook receiptURL
+    Method m = class_getInstanceMethod([NSBundle class], @selector(appStoreReceiptURL));
+    if (m) {
+        _orig_receiptURL = method_setImplementation(m, (IMP)hooked_receiptURL);
+        [_log appendString:@"[OK] receiptURL hook\n"];
+    }
+    
+    // 4. StoreKit hooks
+    m = class_getInstanceMethod([SKPaymentTransaction class], @selector(transactionState));
     if (m) _orig_txState = method_setImplementation(m, (IMP)hooked_txState);
+    m = class_getInstanceMethod([SKPaymentTransaction class], @selector(transactionIdentifier));
+    if (m) _orig_txId = method_setImplementation(m, (IMP)hooked_txId);
+    m = class_getInstanceMethod([SKPaymentTransaction class], @selector(originalTransaction));
+    if (m) _orig_origTx = method_setImplementation(m, (IMP)hooked_origTx);
+    m = class_getInstanceMethod([SKPaymentQueue class], @selector(finishTransaction:));
+    if (m) _orig_finish = method_setImplementation(m, (IMP)hooked_finish);
+    [_log appendString:@"[OK] SK hooks\n"];
     
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // 5. IAP hooks (delayed)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        Class cls = NSClassFromString(@"InAppPurchaseManager");
+        if (cls) {
+            Method mx = class_getInstanceMethod(cls, @selector(paymentQueue:updatedTransactions:));
+            if (mx) _orig_updated = method_setImplementation(mx, (IMP)hooked_updated);
+            Method my = class_getInstanceMethod(cls, @selector(paymentQueueRestoreCompletedTransactionsFinished:));
+            if (my) _orig_restored = method_setImplementation(my, (IMP)hooked_restored);
+            [_log appendString:@"[OK] IAP hooks\n"];
+        }
+        
         [UIPasteboard generalPasteboard].string = _log;
         
+        // Status overlay
         UIWindowScene *sc = nil;
         for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) { sc = s; break; }
         if (!sc) return;
         UIWindow *w = [[UIWindow alloc] initWithWindowScene:sc];
-        w.frame = sc.coordinateSpace.bounds;
+        w.frame = CGRectMake(10, 40, 400, 50);
         w.windowLevel = UIWindowLevelAlert + 100;
-        w.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.92];
+        w.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.9];
+        w.layer.cornerRadius = 10; w.clipsToBounds = YES;
         w.rootViewController = [[UIViewController alloc] init];
-        CGRect b = w.bounds;
+        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(10, 0, 380, 50)];
+        l.numberOfLines = 2;
+        l.font = [UIFont fontWithName:@"Menlo" size:10];
+        l.textColor = [UIColor greenColor];
         
-        UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(20, 50, b.size.width - 40, 30)];
-        t.text = @"v22 - SVP symbols (copy from clipboard)";
-        t.textColor = [UIColor cyanColor];
-        t.font = [UIFont boldSystemFontOfSize:13];
-        [w.rootViewController.view addSubview:t];
+        // Show patch status in banner
+        void *pk = dlsym(RTLD_DEFAULT, "PKCS7_verify");
+        BOOL pkOK = pk && (((uint32_t*)pk)[0] == 0x52800020);
+        l.text = [NSString stringWithFormat:@"v23 | PKCS7:%@ | Receipt:%@\nTap Restore - log in clipboard",
+                  pkOK ? @"✅" : @"❌",
+                  [[NSFileManager defaultManager] fileExistsAtPath:
+                   [NSHomeDirectory() stringByAppendingPathComponent:@"StoreKit/sandboxReceipt"]] ? @"✅" : @"❌"];
         
-        UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(10, 85, b.size.width - 20, b.size.height - 95)];
-        tv.text = _log;
-        tv.font = [UIFont fontWithName:@"Menlo" size:9];
-        tv.textColor = [UIColor greenColor];
-        tv.backgroundColor = [UIColor clearColor];
-        tv.editable = NO;
-        [w.rootViewController.view addSubview:tv];
+        [w.rootViewController.view addSubview:l];
         w.hidden = NO;
-        [w makeKeyAndVisible];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8*NSEC_PER_SEC), dispatch_get_main_queue(), ^{ w.hidden = YES; });
         
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60*NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            [UIPasteboard generalPasteboard].string = _log;
-            w.hidden = YES;
-        });
+        for (int i = 1; i <= 30; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i*2.0*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [UIPasteboard generalPasteboard].string = _log;
+            });
+        }
     });
 }
