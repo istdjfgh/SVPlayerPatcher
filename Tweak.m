@@ -400,7 +400,7 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v34 FAKE LIC ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v35 HFR ===\n\n"];
     
     // 0. Hook Security framework verify functions
     {
@@ -467,18 +467,18 @@ static void tweak_init(void) {
             if (content && [content containsString:@"dummydummy"]) {
                 // Replace h/pid
                 NSString *patched = [content stringByReplacingOccurrencesOfString:@"\"dummydummy\""
-                                                                      withString:@"\"unlock0\""];
+                                                                      withString:@"\"hfr.m.y\""];
                 [patched writeToFile:cfgPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-                [_log appendString:@"[CFG] Patched h/pid: dummydummy -> unlock0 ✅\n"];
-            } else if (content && [content containsString:@"unlock0"]) {
-                [_log appendString:@"[CFG] Already patched (unlock0) ✅\n"];
+                [_log appendString:@"[CFG] Patched h/pid: dummydummy -> hfr.m.y ✅\n"];
+            } else if (content && [content containsString:@"hfr.m.y"]) {
+                [_log appendString:@"[CFG] Already patched (hfr.m.y) ✅\n"];
             } else {
                 [_log appendFormat:@"[CFG] Exists but no dummydummy found\n"];
             }
         } else {
             // Pre-create with premium values
             NSDictionary *cfg = @{
-                @"h/pid": @"unlock0",
+                @"h/pid": @"hfr.m.y",
                 @"h/uid": [[NSUUID UUID] UUIDString],
                 @"h/last_check": @((long)[[NSDate date] timeIntervalSince1970]),
                 @"dev/fast_render": @YES,
@@ -516,7 +516,7 @@ static void tweak_init(void) {
                 NSString *c = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
                 if (c && [c containsString:@"dummydummy"]) {
                     NSString *p = [c stringByReplacingOccurrencesOfString:@"\"dummydummy\""
-                                                              withString:@"\"unlock0\""];
+                                                              withString:@"\"hfr.m.y\""];
                     [p writeToFile:cfgPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
                     [_log appendFormat:@"[CFG] Re-patched at %dms ✅\n", i*500];
                 }
