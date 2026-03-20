@@ -1,78 +1,43 @@
-// SVPlayerPatcher v17b - Crypto bypass
+// SVPlayerPatcher v17c - OpenSSL scan + StoreKit fake (no interpose)
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <StoreKit/StoreKit.h>
-#import <Security/Security.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #include <mach/mach.h>
-#include <sys/mman.h>
 
 static NSMutableString *_log = nil;
 static BOOL _fakeState = NO;
 
 // ========================================
-// PART 1: Interpose SecTrust functions
+// PART 1: Scan for ALL crypto symbols
 // ========================================
-
-static bool my_SecTrustEvalWithErr(SecTrustRef trust, CFErrorRef *error) {
-    [_log appendString:@"[CRYPTO] SecTrustEvalWithErr -> true\n"];
-    if (error) *error = NULL;
-    return true;
-}
-
-static OSStatus my_SecTrustEval(SecTrustRef trust, SecTrustResultType *result) {
-    [_log appendString:@"[CRYPTO] SecTrustEval -> proceed\n"];
-    if (result) *result = kSecTrustResultProceed;
-    return errSecSuccess;
-}
-
-// Interpose section
-typedef struct { const void *replacement; const void *replacee; } interpose_t;
-
-__attribute__((used)) static const interpose_t interps[]
-__attribute__((section("__DATA,__interpose"))) = {
-    { (const void *)my_SecTrustEvalWithErr, (const void *)SecTrustEvaluateWithError },
-    { (const void *)my_SecTrustEval, (const void *)SecTrustEvaluate },
-};
-
-// ========================================
-// PART 2: Scan and patch OpenSSL
-// ========================================
-
-static void hookOpenSSL(void) {
+static void scanCrypto(void) {
     const char *names[] = {
-        "PKCS7_verify", "X509_verify_cert", "EVP_VerifyFinal",
-        "ECDSA_verify", "RSA_verify", "EVP_DigestVerifyFinal", NULL
+        "PKCS7_verify", "PKCS7_sign", "PKCS7_get_signer_info",
+        "X509_verify_cert", "EVP_VerifyFinal", "EVP_DigestVerifyFinal",
+        "ECDSA_verify", "RSA_verify", "d2i_PKCS7", "i2d_PKCS7",
+        "OPENSSL_init_ssl", "SSL_library_init",
+        "BIO_new", "BIO_read", "BIO_write",
+        "ASN1_get_object", "ASN1_item_d2i",
+        "SecCMSVerify", "CMSDecoderCreate",
+        "SecTrustEvaluateWithError", "SecTrustEvaluate",
+        NULL
     };
     
+    [_log appendString:@"=== Crypto Symbol Scan ===\n"];
     for (int i = 0; names[i]; i++) {
         void *sym = dlsym(RTLD_DEFAULT, names[i]);
-        [_log appendFormat:@"[SCAN] %s = %s\n", names[i], sym ? "FOUND" : "no"];
-        
-        if (sym && (strcmp(names[i], "PKCS7_verify") == 0 ||
-                    strcmp(names[i], "EVP_VerifyFinal") == 0 ||
-                    strcmp(names[i], "EVP_DigestVerifyFinal") == 0)) {
-            // Try to patch: MOV W0, #1; RET
-            uint32_t *fn = (uint32_t *)sym;
-            vm_address_t page = (vm_address_t)fn & ~(vm_address_t)0x3FFF;
-            kern_return_t kr = vm_protect(mach_task_self(), page, 0x4000, FALSE,
-                                          VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-            if (kr == KERN_SUCCESS) {
-                fn[0] = 0x52800020; // MOV W0, #1
-                fn[1] = 0xD65F03C0; // RET
-                [_log appendFormat:@"[PATCH] %s -> return 1\n", names[i]];
-            } else {
-                [_log appendFormat:@"[FAIL] vm_protect %s: %d\n", names[i], kr];
-            }
+        if (sym) {
+            [_log appendFormat:@"  FOUND: %s @ %p\n", names[i], sym];
         }
     }
+    [_log appendString:@"\n"];
 }
 
 // ========================================
-// PART 3: StoreKit faking
+// PART 2: StoreKit faking
 // ========================================
-
 static IMP _orig_txState = NULL;
 static NSInteger hooked_txState(id self, SEL _cmd) {
     if (_fakeState) return SKPaymentTransactionStateRestored;
@@ -134,9 +99,9 @@ static void patchConfig(void) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v17b CRYPTO ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v17c ===\n\n"];
     
-    hookOpenSSL();
+    scanCrypto();
     
     Method m;
     m = class_getInstanceMethod([SKPaymentTransaction class], @selector(transactionState));
@@ -173,7 +138,7 @@ static void tweak_init(void) {
         w.layer.cornerRadius = 8; w.clipsToBounds = YES;
         w.rootViewController = [[UIViewController alloc] init];
         UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(10, 0, 360, 30)];
-        l.text = @"✅ v17b CRYPTO - tap Buy then Cancel!";
+        l.text = @"✅ v17c scan done - tap Buy then Cancel!";
         l.textColor = [UIColor greenColor];
         l.font = [UIFont boldSystemFontOfSize:13];
         [w.rootViewController.view addSubview:l];
