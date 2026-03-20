@@ -145,10 +145,10 @@ static void tweak_init(void) {
         Class cls = NSClassFromString(@"InAppPurchaseManager");
         if (!cls) return;
         
-        m = class_getInstanceMethod(cls, @selector(paymentQueue:updatedTransactions:));
-        if (m) _orig_updated = method_setImplementation(m, (IMP)hooked_updated);
-        m = class_getInstanceMethod(cls, @selector(paymentQueueRestoreCompletedTransactionsFinished:));
-        if (m) _orig_restored = method_setImplementation(m, (IMP)hooked_restored);
+        Method mx = class_getInstanceMethod(cls, @selector(paymentQueue:updatedTransactions:));
+        if (mx) _orig_updated = method_setImplementation(mx, (IMP)hooked_updated);
+        Method my = class_getInstanceMethod(cls, @selector(paymentQueueRestoreCompletedTransactionsFinished:));
+        if (my) _orig_restored = method_setImplementation(my, (IMP)hooked_restored);
         [_log appendString:@"[OK] IAP\n"];
         
         [UIPasteboard generalPasteboard].string = _log;
