@@ -83,27 +83,30 @@ static void dumpIAPManager(void) {
     }
     if (methods) free(methods);
     
-    // Properties (safe - class metadata)
+    // Properties (safe - class metadata) + KVC reads
     unsigned int pc = 0;
     objc_property_t *props = class_copyPropertyList(cls, &pc);
+    NSMutableArray *propNames = [NSMutableArray array];
     [_log appendFormat:@"\nProperties (%d):\n", pc];
     for (unsigned int i = 0; i < pc; i++) {
-        [_log appendFormat:@"  %s\n", property_getName(props[i])];
+        NSString *pn = [NSString stringWithUTF8String:property_getName(props[i])];
+        [propNames addObject:pn];
+        [_log appendFormat:@"  %@\n", pn];
     }
     if (props) free(props);
     
-    // Try reading properties via KVC (safer than ivar access)
+    // Read property values via KVC
     [_log appendString:@"\nKVC values:\n"];
-    for (unsigned int i = 0; i < pc; i++) {
-        NSString *pn = [NSString stringWithUTF8String:property_getName(props[i])];
+    for (NSString *pn in propNames) {
         @try {
             id val = [_iapManager valueForKey:pn];
-            [_log appendFormat:@"  %@ = %@\n", pn, val];
+            NSString *desc = [val description];
+            if (desc.length > 100) desc = [[desc substringToIndex:100] stringByAppendingString:@"..."];
+            [_log appendFormat:@"  %@ = %@\n", pn, desc];
         } @catch (NSException *e) {
-            [_log appendFormat:@"  %@ = <err: %@>\n", pn, e.reason];
+            [_log appendFormat:@"  %@ = <err>\n", pn];
         }
     }
-    if (props) free(props);
     
     // Ivar names only (don't read values)
     unsigned int ic = 0;
