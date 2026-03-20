@@ -391,7 +391,7 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v24 DIAG ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v25 CONFIG PATCH ===\n\n"];
     
     // 1. Verify binary patches
     verifyPatch();
@@ -399,14 +399,79 @@ static void tweak_init(void) {
     // 2. Write fake receipt
     writeFakeReceipt();
     
-    // 2b. Test receipt parsing with d2i_PKCS7
+    // 2b. Test receipt parsing
     NSData *testReceipt = buildFakeReceipt([[NSBundle mainBundle] bundleIdentifier] ?: @"com.svpteam.svp");
     testReceiptParsing(testReceipt);
     
-    // 2c. Dump config files
-    dumpMainCfg();
+    // ==========================================
+    // 3. PATCH main.cfg - the key to premium!
+    // ==========================================
+    NSString *cfgDir = [NSHomeDirectory() stringByAppendingPathComponent:
+                        @"Library/Application Support/SVPlayer/settings"];
+    NSString *cfgPath = [cfgDir stringByAppendingPathComponent:@"main.cfg"];
     
-    // 3. Hook receiptURL
+    // Pre-create the config directory
+    [[NSFileManager defaultManager] createDirectoryAtPath:cfgDir
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    
+    // If main.cfg already exists, patch it
+    // If not, pre-create with premium values
+    void (^patchConfig)(void) = ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if ([fm fileExistsAtPath:cfgPath]) {
+            NSData *d = [NSData dataWithContentsOfFile:cfgPath];
+            NSString *content = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+            
+            if (content && [content containsString:@"dummydummy"]) {
+                // Replace h/pid
+                NSString *patched = [content stringByReplacingOccurrencesOfString:@"\"dummydummy\""
+                                                                      withString:@"\"unlock0\""];
+                [patched writeToFile:cfgPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                [_log appendString:@"[CFG] Patched h/pid: dummydummy -> unlock0 ✅\n"];
+            } else if (content && [content containsString:@"unlock0"]) {
+                [_log appendString:@"[CFG] Already patched (unlock0) ✅\n"];
+            } else {
+                [_log appendFormat:@"[CFG] Exists but no dummydummy found\n"];
+            }
+        } else {
+            // Pre-create with premium values
+            NSDictionary *cfg = @{
+                @"h/pid": @"unlock0",
+                @"h/uid": [[NSUUID UUID] UUIDString],
+                @"h/last_check": @((long)[[NSDate date] timeIntervalSince1970]),
+                @"dev/fast_render": @YES,
+                @"performance/cpu": @7800,
+                @"performance/gpu": @1000,
+                @"performance/db": @YES,
+            };
+            NSData *json = [NSJSONSerialization dataWithJSONObject:cfg options:NSJSONWritingPrettyPrinted error:nil];
+            [json writeToFile:cfgPath atomically:YES];
+            [_log appendString:@"[CFG] Pre-created with unlock0 ✅\n"];
+        }
+        [UIPasteboard generalPasteboard].string = _log;
+    };
+    
+    patchConfig(); // Patch NOW (before Qt init)
+    
+    // Also keep re-patching every 500ms for 15 seconds (in case Qt overwrites)
+    for (int i = 1; i <= 30; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 500 * NSEC_PER_MSEC)), dispatch_get_global_queue(0, 0), ^{
+            NSData *d = [NSData dataWithContentsOfFile:cfgPath];
+            if (d) {
+                NSString *c = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+                if (c && [c containsString:@"dummydummy"]) {
+                    NSString *p = [c stringByReplacingOccurrencesOfString:@"\"dummydummy\""
+                                                              withString:@"\"unlock0\""];
+                    [p writeToFile:cfgPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                    [_log appendFormat:@"[CFG] Re-patched at %dms ✅\n", i*500];
+                }
+            }
+        });
+    }
+    
+    [_log appendString:@"\n"];
+    
+    // 4. Hook receiptURL
     Method m = class_getInstanceMethod([NSBundle class], @selector(appStoreReceiptURL));
     if (m) {
         _orig_receiptURL = method_setImplementation(m, (IMP)hooked_receiptURL);
