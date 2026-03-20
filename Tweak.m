@@ -400,7 +400,7 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v35 HFR ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v36 DUMP ===\n\n"];
     
     // 0. Hook Security framework verify functions
     {
@@ -793,8 +793,40 @@ static void tweak_init(void) {
         [UIPasteboard generalPasteboard].string = _log;
     });
     
-    // 6. DELAYED full file scan (10s - after Qt/app init creates configs)
+    // 6. DELAYED: dump UserDefaults + plist + full file scan (10s)
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // Dump NSUserDefaults
+        [_log appendString:@"\n=== NSUserDefaults (10s) ===\n"];
+        NSDictionary *defaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+        for (NSString *key in [defaults.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+            id val = defaults[key];
+            NSString *valStr = [NSString stringWithFormat:@"%@", val];
+            if (valStr.length > 80) valStr = [valStr substringToIndex:80];
+            [_log appendFormat:@"  %@ = %@\n", key, valStr];
+        }
+        
+        // Dump plist file directly 
+        NSString *plistPath = [NSHomeDirectory() stringByAppendingPathComponent:
+                               @"Library/Preferences/com.svpteam.svp.plist"];
+        NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+        if (plist) {
+            [_log appendFormat:@"\n=== com.svpteam.svp.plist ===\n"];
+            for (NSString *key in plist) {
+                [_log appendFormat:@"  %@ = %@\n", key, plist[key]];
+            }
+        }
+        
+        // Dump FULL main.cfg
+        NSString *cfgP = [NSHomeDirectory() stringByAppendingPathComponent:
+                          @"Library/Application Support/SVPlayer/settings/main.cfg"];
+        NSData *cfgD = [NSData dataWithContentsOfFile:cfgP];
+        if (cfgD) {
+            NSString *cfgStr = [[NSString alloc] initWithData:cfgD encoding:NSUTF8StringEncoding];
+            [_log appendFormat:@"\n=== FULL main.cfg ===\n%@\n", cfgStr];
+        }
+        
+        [UIPasteboard generalPasteboard].string = _log;
+        
         [_log appendString:@"\n=== DELAYED FILE SCAN (10s) ===\n"];
         
         NSFileManager *fm = [NSFileManager defaultManager];
