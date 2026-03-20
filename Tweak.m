@@ -395,7 +395,7 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v28 ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v29 INJECT ===\n\n"];
     
     // 0. Hook Security framework verify functions
     {
@@ -601,7 +601,7 @@ static void tweak_init(void) {
     if (m) _orig_finish = method_setImplementation(m, (IMP)hooked_finish);
     [_log appendString:@"[OK] SK hooks\n"];
     
-    // 5. IAP hooks + DELAYED file scan
+    // 5. IAP hooks + INJECT fake purchase
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         Class cls = NSClassFromString(@"InAppPurchaseManager");
         if (cls) {
@@ -610,6 +610,61 @@ static void tweak_init(void) {
             Method my = class_getInstanceMethod(cls, @selector(paymentQueueRestoreCompletedTransactionsFinished:));
             if (my) _orig_restored = method_setImplementation(my, (IMP)hooked_restored);
             [_log appendString:@"[OK] IAP hooks\n"];
+        }
+        [UIPasteboard generalPasteboard].string = _log;
+    });
+    
+    // 5a. INJECT fake purchase after 6s (after IAP hooks are set)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // Find the InAppPurchaseManager instance via SKPaymentQueue observers
+        SKPaymentQueue *queue = [SKPaymentQueue defaultQueue];
+        NSArray *observers = [queue performSelector:@selector(transactionObservers)
+                                                     withObject:nil];
+        id iapManager = nil;
+        if (!observers || [observers count] == 0) {
+            // Try via delegate
+            @try {
+                observers = [queue valueForKey:@"_observers"];
+            } @catch(NSException *e) {}
+        }
+        
+        for (id obs in observers) {
+            if ([obs isKindOfClass:NSClassFromString(@"InAppPurchaseManager")]) {
+                iapManager = obs;
+                break;
+            }
+        }
+        
+        if (iapManager) {
+            [_log appendFormat:@"[INJECT] Found IAP manager instance ✅\n"];
+            
+            // Create fake SKPayment
+            SKMutablePayment *payment = [[SKMutablePayment alloc] init];
+            [payment setProductIdentifier:@"hfr.m.y"];
+            
+            // We can't create SKPaymentTransaction directly, but we can call 
+            // the original (unhooked) method with our hooked state
+            // Let _fakeState = YES so transactionState returns "Purchased"
+            _fakeState = YES;
+            
+            // Trigger restore flow - this calls the original handler
+            // The IAP manager will call backend->purchaseSucceeded via C++
+            @try {
+                // Call restoreCompletedTransactionsFinished first
+                [iapManager paymentQueueRestoreCompletedTransactionsFinished:queue];
+                [_log appendString:@"[INJECT] Called restoreCompleted ✅\n"];
+            } @catch(NSException *e) {
+                [_log appendFormat:@"[INJECT] restore error: %@\n", e];
+            }
+            
+            _fakeState = NO;
+        } else {
+            [_log appendFormat:@"[INJECT] IAP manager NOT found. Queue observers: %lu\n",
+             (unsigned long)[observers count]];
+            // List all observers
+            for (id obs in observers) {
+                [_log appendFormat:@"  observer: %@\n", NSStringFromClass([obs class])];
+            }
         }
         [UIPasteboard generalPasteboard].string = _log;
     });
