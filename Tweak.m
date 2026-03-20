@@ -481,9 +481,18 @@ static void tweak_init(void) {
     patchConfig(); // Patch NOW (before Qt init)
     
     // DON'T make read-only! Qt needs to READ the file.
-    // Instead keep re-patching if Qt overwrites with dummydummy
+    // Keep re-patching if Qt overwrites with dummydummy + keep deleting svp.lic
+    NSString *licPath2 = [NSHomeDirectory() stringByAppendingPathComponent:
+                          @"Library/Application Support/SVPlayer/settings/svp.lic"];
     for (int i = 1; i <= 60; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 500 * NSEC_PER_MSEC)), dispatch_get_global_queue(0, 0), ^{
+            // Delete svp.lic EVERY iteration
+            if ([[NSFileManager defaultManager] fileExistsAtPath:licPath2]) {
+                [[NSFileManager defaultManager] removeItemAtPath:licPath2 error:nil];
+                [_log appendFormat:@"[LIC] Deleted svp.lic at %dms ✅\n", i*500];
+            }
+            
+            // Re-patch main.cfg if dummydummy appeared
             NSData *d = [NSData dataWithContentsOfFile:cfgPath];
             if (d) {
                 NSString *c = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
