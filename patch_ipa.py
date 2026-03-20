@@ -266,7 +266,7 @@ def patch_ipa(ipa_path):
             'RSA_verify', 'EVP_VerifyFinal', 'EVP_DigestVerifyFinal',
             'ECDSA_verify', 'DSA_verify', 'CMS_SignerInfo_verify',
             'ASN1_item_verify', 'ASN1_verify',
-            'RSA_public_decrypt',  # License file decryption!
+            # NOTE: Do NOT patch RSA_public_decrypt - it breaks license validation!
         ]
         patched = 0
         for sym in symbols:

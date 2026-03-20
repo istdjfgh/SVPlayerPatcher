@@ -400,7 +400,7 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v36 DUMP ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v37 HTTP ===\n\n"];
     
     // 0. Hook Security framework verify functions
     {
@@ -781,7 +781,70 @@ static void tweak_init(void) {
         [UIPasteboard generalPasteboard].string = _log;
     });
     
-    // 5b. Read main.cfg AFTER Qt loaded it (5s)
+    // 5c. Try SVP internal webui HTTP API (8s)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [_log appendString:@"\n=== SVP HTTP API PROBE ===\n"];
+        
+        // Read /tmp/svp-http for port info
+        NSString *tmpHttp = @"/tmp/svp-http";
+        NSData *httpData = [NSData dataWithContentsOfFile:tmpHttp];
+        if (httpData) {
+            NSString *httpStr = [[NSString alloc] initWithData:httpData encoding:NSUTF8StringEncoding];
+            [_log appendFormat:@"[HTTP] /tmp/svp-http: %@\n", httpStr];
+        }
+        
+        // Also check app container tmp
+        NSString *appTmp = [NSHomeDirectory() stringByAppendingPathComponent:@"tmp/svp-http"];
+        NSData *appHttpData = [NSData dataWithContentsOfFile:appTmp];
+        if (appHttpData) {
+            NSString *s = [[NSString alloc] initWithData:appHttpData encoding:NSUTF8StringEncoding];
+            [_log appendFormat:@"[HTTP] app/tmp/svp-http: %@\n", s];
+        }
+        
+        // Scan tmp for any svp files 
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSArray *tmpFiles = [fm contentsOfDirectoryAtPath:@"/tmp" error:nil];
+        for (NSString *f in tmpFiles) {
+            if ([f containsString:@"svp"]) {
+                NSString *content = [[NSString alloc] initWithContentsOfFile:[@"/tmp" stringByAppendingPathComponent:f]
+                                                                   encoding:NSUTF8StringEncoding error:nil];
+                [_log appendFormat:@"[TMP] %@ = %@\n", f, content ?: @"<binary>"];
+            }
+        }
+        
+        // Try common webui ports
+        for (int port = 9000; port <= 9010; port++) {
+            NSString *url = [NSString stringWithFormat:@"http://127.0.0.1:%d/r/reg", port];
+            NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]
+                                                              cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                          timeoutInterval:1.0];
+            req.HTTPMethod = @"POST";
+            NSHTTPURLResponse *resp = nil;
+            NSError *err = nil;
+            NSData *data = [NSURLConnection sendSynchronousRequest:req returningResponse:&resp error:&err];
+            if (data && resp.statusCode == 200) {
+                NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                [_log appendFormat:@"[API] Port %d: %@\n", port, body];
+                
+                // Try to set h/pid via r/set-opt
+                NSString *setUrl = [NSString stringWithFormat:@"http://127.0.0.1:%d/r/set-opt", port];
+                NSMutableURLRequest *setReq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:setUrl]];
+                setReq.HTTPMethod = @"POST";
+                NSString *postBody = @"n=h/pid&v=hfr.m.y";
+                setReq.HTTPBody = [postBody dataUsingEncoding:NSUTF8StringEncoding];
+                [setReq setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+                NSData *setData = [NSURLConnection sendSynchronousRequest:setReq returningResponse:&resp error:&err];
+                if (setData) {
+                    NSString *setBody = [[NSString alloc] initWithData:setData encoding:NSUTF8StringEncoding];
+                    [_log appendFormat:@"[SET-OPT] Port %d: %@\n", port, setBody];
+                }
+                break;
+            }
+        }
+        
+        [UIPasteboard generalPasteboard].string = _log;
+    });
+    
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         NSData *cfgData = [NSData dataWithContentsOfFile:cfgPath];
         if (cfgData) {
