@@ -411,12 +411,25 @@ static void tweak_init(void) {
             [_log appendString:@"[SEC] SecKeyRawVerify found\n"];
         }
         
-        // Delete svp.lic to force fresh license check
+        // Replace svp.lic with a DIRECTORY - fopen on a dir returns NULL!
+        // Qt can't recreate the file because the path is occupied by a dir.
         NSString *licPath = [NSHomeDirectory() stringByAppendingPathComponent:
                              @"Library/Application Support/SVPlayer/settings/svp.lic"];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:licPath]) {
-            [[NSFileManager defaultManager] removeItemAtPath:licPath error:nil];
-            [_log appendString:@"[LIC] Deleted svp.lic ✅\n"];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        BOOL isDir = NO;
+        if ([fm fileExistsAtPath:licPath isDirectory:&isDir]) {
+            if (!isDir) {
+                // It's a file - delete it and create dir instead
+                [fm removeItemAtPath:licPath error:nil];
+                [fm createDirectoryAtPath:licPath withIntermediateDirectories:YES attributes:nil error:nil];
+                [_log appendString:@"[LIC] Replaced file with DIR ✅\n"];
+            } else {
+                [_log appendString:@"[LIC] Already a DIR ✅\n"];
+            }
+        } else {
+            // Create as directory preemptively
+            [fm createDirectoryAtPath:licPath withIntermediateDirectories:YES attributes:nil error:nil];
+            [_log appendString:@"[LIC] Created DIR trap ✅\n"];
         }
     }
     
@@ -486,10 +499,16 @@ static void tweak_init(void) {
                           @"Library/Application Support/SVPlayer/settings/svp.lic"];
     for (int i = 1; i <= 60; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 500 * NSEC_PER_MSEC)), dispatch_get_global_queue(0, 0), ^{
-            // Delete svp.lic EVERY iteration
-            if ([[NSFileManager defaultManager] fileExistsAtPath:licPath2]) {
-                [[NSFileManager defaultManager] removeItemAtPath:licPath2 error:nil];
-                [_log appendFormat:@"[LIC] Deleted svp.lic at %dms ✅\n", i*500];
+            // Maintain svp.lic directory trap
+            BOOL isD = NO;
+            if ([[NSFileManager defaultManager] fileExistsAtPath:licPath2 isDirectory:&isD]) {
+                if (!isD) {
+                    // Qt somehow wrote a file - replace with dir again
+                    [[NSFileManager defaultManager] removeItemAtPath:licPath2 error:nil];
+                    [[NSFileManager defaultManager] createDirectoryAtPath:licPath2 
+                        withIntermediateDirectories:YES attributes:nil error:nil];
+                    [_log appendFormat:@"[LIC] Re-trapped at %dms ✅\n", i*500];
+                }
             }
             
             // Re-patch main.cfg if dummydummy appeared
