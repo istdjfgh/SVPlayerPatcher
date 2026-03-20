@@ -1,88 +1,104 @@
-// SVPlayerPatcher v4 - Find SVPlayer's OWN classes
+// SVPlayerPatcher v5 - Target search for SVPlayer classes
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
 static UIWindow *_overlayWindow = nil;
 
-// Known Apple framework prefixes to SKIP
-static BOOL isAppleClass(NSString *name) {
-    NSArray *applePrefixes = @[
-        @"NS", @"UI", @"CF", @"CG", @"CA", @"CI", @"CL", @"CM", @"CN",
-        @"AV", @"SK", @"SC", @"WK", @"MK", @"PK", @"GC", @"GL", @"MT",
-        @"FC", @"NF", @"PR", @"TP", @"AX", @"VO", @"LS", @"BS", @"FBS",
-        @"_NS", @"_UI", @"_CF", @"_CG", @"_CA", @"_AV", @"_SK", @"_WK",
-        @"__NS", @"__CF", @"OS_", @"_TtC", @"_TtG", @"SCRO", @"RBS",
-        @"RCKey", @"Mobile", @"Web", @"Net", @"Sec", @"SSL", @"TLS",
-        @"IO", @"HID", @"BK", @"MCPeerID", @"GKP", @"ASIdentifier",
-        @"CT", @"AT", @"AD", @"AB", @"EK", @"HK", @"INS", @"MAP",
-        @"MPMedia", @"NWC", @"PHAsset", @"QL", @"SF", @"SRP",
-        @"TCC", @"UTType", @"XPC", @"CBCentral", @"NWDB",
-        @"PLBuild", @"NewsCore", @"NFP", @"CKRecord",
-        @"ObjC", @"Swift", @"swift", @"Block", @"Malloc",
-        @"dispatch", @"os_", @"objc", @"cxx"
-    ];
-    for (NSString *prefix in applePrefixes) {
-        if ([name hasPrefix:prefix]) return YES;
-    }
-    // Skip single-letter or very short class names
-    if (name.length < 4) return YES;
-    // Skip classes containing "Apple" or starting with lowercase
-    if ([name containsString:@"Apple"]) return YES;
-    if ([[NSCharacterSet lowercaseLetterCharacterSet] characterIsMember:[name characterAtIndex:0]]) return YES;
-    return NO;
-}
-
 static NSString* scanClasses(void) {
     int numClasses = objc_getClassList(NULL, 0);
     Class *classes = (__unsafe_unretained Class *)malloc(sizeof(Class) * numClasses);
     objc_getClassList(classes, numClasses);
     
-    NSMutableString *results = [NSMutableString stringWithString:@"=== SVPlayer OWN Classes ===\n\n"];
+    NSMutableString *results = [NSMutableString stringWithString:@"=== SVPlayer Target Scan ===\n\n"];
+    
+    // SVPlayer-specific prefixes and keywords
+    NSArray *targetPrefixes = @[
+        @"SV", @"SVP", @"Player", @"Video", @"Smooth",
+        @"Motion", @"Frame", @"Interp", @"MEMC", @"Render",
+        @"Decode", @"Stream", @"Codec", @"FFmpeg", @"mpv",
+        @"MPV", @"Metal", @"OpenGL", @"Vulkan"
+    ];
+    
+    NSArray *targetContains = @[
+        @"premium", @"subscribe", @"purchase", @"license",
+        @"paid", @"trial", @"unlock", @"iap", @"billing",
+        @"pro", @"vip", @"setting", @"config", @"prefer",
+        @"interpolat", @"memc", @"framerate", @"fps",
+        @"smooth", @"motion", @"compensation"
+    ];
+    
     int found = 0;
     
     for (int i = 0; i < numClasses; i++) {
         const char *name = class_getName(classes[i]);
         if (!name) continue;
         NSString *className = [NSString stringWithUTF8String:name];
+        NSString *lowerName = [className lowercaseString];
         
-        if (isAppleClass(className)) continue;
+        // Skip obvious Apple/system classes
+        if ([className hasPrefix:@"_"] || [className hasPrefix:@"__"]) continue;
+        if (className.length < 3) continue;
         
-        found++;
-        [results appendFormat:@"CLASS: %@\n", className];
+        BOOL match = NO;
         
-        // List ALL properties
-        unsigned int propCount = 0;
-        objc_property_t *props = class_copyPropertyList(classes[i], &propCount);
-        for (unsigned int j = 0; j < propCount; j++) {
-            const char *pn = property_getName(props[j]);
-            [results appendFormat:@"  P: %s\n", pn];
+        // Check prefixes
+        for (NSString *prefix in targetPrefixes) {
+            if ([className hasPrefix:prefix]) { match = YES; break; }
         }
-        if (props) free(props);
         
-        // List key methods only
-        unsigned int methodCount = 0;
-        Method *methods = class_copyMethodList(classes[i], &methodCount);
-        for (unsigned int j = 0; j < methodCount; j++) {
-            SEL sel = method_getName(methods[j]);
-            NSString *selName = NSStringFromSelector(sel);
-            NSString *ls = [selName lowercaseString];
-            if ([ls hasPrefix:@"is"] || [ls hasPrefix:@"has"] || [ls hasPrefix:@"set"] ||
-                [ls containsString:@"premium"] || [ls containsString:@"pro"] ||
-                [ls containsString:@"purchase"] || [ls containsString:@"subscri"] ||
-                [ls containsString:@"unlock"] || [ls containsString:@"paid"] ||
-                [ls containsString:@"init"] || [ls containsString:@"enable"] ||
-                [ls containsString:@"license"] || [ls containsString:@"active"] ||
-                [ls containsString:@"valid"] || [ls containsString:@"expire"]) {
-                [results appendFormat:@"  M: %@\n", selName];
+        // Check contains (case insensitive)
+        if (!match) {
+            for (NSString *keyword in targetContains) {
+                if ([lowerName containsString:keyword]) { match = YES; break; }
             }
         }
-        if (methods) free(methods);
-        [results appendString:@"\n"];
+        
+        if (match) {
+            found++;
+            [results appendFormat:@"\nCLASS: %@\n", className];
+            
+            // ALL properties
+            unsigned int propCount = 0;
+            objc_property_t *props = class_copyPropertyList(classes[i], &propCount);
+            for (unsigned int j = 0; j < propCount; j++) {
+                [results appendFormat:@"  P: %s\n", property_getName(props[j])];
+            }
+            if (props) free(props);
+            
+            // ALL methods (not just filtered)
+            unsigned int methodCount = 0;
+            Method *methods = class_copyMethodList(classes[i], &methodCount);
+            if (methodCount <= 50) { // Only dump if not too many
+                for (unsigned int j = 0; j < methodCount; j++) {
+                    SEL sel = method_getName(methods[j]);
+                    [results appendFormat:@"  M: %@\n", NSStringFromSelector(sel)];
+                }
+            } else {
+                [results appendFormat:@"  (%d methods - showing key ones)\n", methodCount];
+                for (unsigned int j = 0; j < methodCount; j++) {
+                    SEL sel = method_getName(methods[j]);
+                    NSString *sn = NSStringFromSelector(sel);
+                    NSString *ls = [sn lowercaseString];
+                    if ([ls hasPrefix:@"is"] || [ls hasPrefix:@"has"] || [ls hasPrefix:@"set"] ||
+                        [ls containsString:@"init"] || [ls containsString:@"premium"] ||
+                        [ls containsString:@"enable"] || [ls containsString:@"active"] ||
+                        [ls containsString:@"purchase"] || [ls containsString:@"subscri"] ||
+                        [ls containsString:@"unlock"] || [ls containsString:@"license"] ||
+                        [ls containsString:@"paid"] || [ls containsString:@"pro"] ||
+                        [ls containsString:@"valid"] || [ls containsString:@"expire"] ||
+                        [ls containsString:@"interpolat"] || [ls containsString:@"fps"] ||
+                        [ls containsString:@"frame"] || [ls containsString:@"smooth"] ||
+                        [ls containsString:@"motion"] || [ls containsString:@"memc"]) {
+                        [results appendFormat:@"  M: %@\n", sn];
+                    }
+                }
+            }
+        }
     }
     
     free(classes);
-    [results appendFormat:@"\n=== Found %d non-Apple classes ===\n", found];
+    [results appendFormat:@"\n\n=== Found %d target classes ===\n", found];
     return results;
 }
 
@@ -90,18 +106,14 @@ __attribute__((constructor))
 static void tweak_init(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         NSString *results = scanClasses();
-        
         [UIPasteboard generalPasteboard].string = results;
         
         NSString *docsPath = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
         [results writeToFile:[docsPath stringByAppendingPathComponent:@"svplayer_classes.txt"]
                   atomically:YES encoding:NSUTF8StringEncoding error:nil];
         
-        // Show overlay
         UIWindowScene *scene = nil;
-        for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) {
-            scene = s; break;
-        }
+        for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) { scene = s; break; }
         if (!scene) return;
         
         _overlayWindow = [[UIWindow alloc] initWithWindowScene:scene];
@@ -113,7 +125,7 @@ static void tweak_init(void) {
         CGRect b = _overlayWindow.bounds;
         
         UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20, 50, b.size.width - 40, 30)];
-        title.text = [NSString stringWithFormat:@"SVPlayer OWN Classes - AUTO COPIED - tap overlay 30s to close"];
+        title.text = @"SVPlayer Classes - COPIED TO CLIPBOARD - closes in 60s";
         title.textColor = [UIColor cyanColor];
         title.font = [UIFont boldSystemFontOfSize:14];
         title.adjustsFontSizeToFitWidth = YES;
@@ -131,7 +143,7 @@ static void tweak_init(void) {
         _overlayWindow.hidden = NO;
         [_overlayWindow makeKeyAndVisible];
         
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             _overlayWindow.hidden = YES;
             _overlayWindow = nil;
         });
