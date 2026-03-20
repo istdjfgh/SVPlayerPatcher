@@ -466,7 +466,7 @@ static void tweak_init(void) {
     if (m) _orig_finish = method_setImplementation(m, (IMP)hooked_finish);
     [_log appendString:@"[OK] SK hooks\n"];
     
-    // 5. IAP hooks (delayed)
+    // 5. IAP hooks + DELAYED file scan
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         Class cls = NSClassFromString(@"InAppPurchaseManager");
         if (cls) {
@@ -476,36 +476,69 @@ static void tweak_init(void) {
             if (my) _orig_restored = method_setImplementation(my, (IMP)hooked_restored);
             [_log appendString:@"[OK] IAP hooks\n"];
         }
+        [UIPasteboard generalPasteboard].string = _log;
+    });
+    
+    // 6. DELAYED full file scan (10s - after Qt/app init creates configs)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [_log appendString:@"\n=== DELAYED FILE SCAN (10s) ===\n"];
+        
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *home = NSHomeDirectory();
+        NSDirectoryEnumerator *en = [fm enumeratorAtPath:home];
+        NSString *item;
+        int total = 0;
+        while ((item = [en nextObject]) && total < 80) {
+            // Skip known uninteresting dirs
+            if ([item hasPrefix:@"Library/SplashBoard"] || [item hasPrefix:@"Library/Caches/com.apple"] ||
+                [item hasPrefix:@"Library/WebKit"] || [item hasPrefix:@"Library/Saved"] ||
+                [item containsString:@".ktx"]) continue;
+            
+            NSString *full = [home stringByAppendingPathComponent:item];
+            BOOL isDir = NO;
+            [fm fileExistsAtPath:full isDirectory:&isDir];
+            if (isDir) continue;
+            
+            NSDictionary *a = [fm attributesOfItemAtPath:full error:nil];
+            unsigned long long sz = [a[NSFileSize] unsignedLongLongValue];
+            [_log appendFormat:@"  %@ (%llu)\n", item, sz];
+            
+            // Read cfg/lic/ini/plist files
+            NSString *lower = [item lowercaseString];
+            if (([lower hasSuffix:@".cfg"] || [lower hasSuffix:@".lic"] || [lower hasSuffix:@".ini"] ||
+                 [lower hasSuffix:@".plist"]) && sz < 3000 && sz > 0) {
+                NSData *d = [NSData dataWithContentsOfFile:full];
+                NSString *c = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+                if (c) {
+                    if (c.length > 300) c = [c substringToIndex:300];
+                    [_log appendFormat:@"    ---\n%@\n    ---\n", c];
+                }
+            }
+            total++;
+        }
+        [_log appendFormat:@"  (listed %d files)\n", total];
         
         [UIPasteboard generalPasteboard].string = _log;
         
-        // Status overlay
+        // Banner
         UIWindowScene *sc = nil;
         for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) { sc = s; break; }
         if (!sc) return;
         UIWindow *w = [[UIWindow alloc] initWithWindowScene:sc];
-        w.frame = CGRectMake(10, 40, 400, 50);
+        w.frame = CGRectMake(10, 40, 400, 40);
         w.windowLevel = UIWindowLevelAlert + 100;
         w.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.9];
-        w.layer.cornerRadius = 10; w.clipsToBounds = YES;
+        w.layer.cornerRadius = 8; w.clipsToBounds = YES;
         w.rootViewController = [[UIViewController alloc] init];
-        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(10, 0, 380, 50)];
-        l.numberOfLines = 2;
-        l.font = [UIFont fontWithName:@"Menlo" size:10];
-        l.textColor = [UIColor greenColor];
-        
-        // Show patch status in banner
-        void *pk = dlsym(RTLD_DEFAULT, "PKCS7_verify");
-        BOOL pkOK = pk && (((uint32_t*)pk)[0] == 0x52800020);
-        l.text = [NSString stringWithFormat:@"v23 | PKCS7:%@ | Receipt:%@\nTap Restore - log in clipboard",
-                  pkOK ? @"✅" : @"❌",
-                  [[NSFileManager defaultManager] fileExistsAtPath:
-                   [NSHomeDirectory() stringByAppendingPathComponent:@"StoreKit/sandboxReceipt"]] ? @"✅" : @"❌"];
-        
+        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(10, 0, 380, 40)];
+        l.text = @"v24b | Restore → check clipboard 📋";
+        l.font = [UIFont fontWithName:@"Menlo" size:11];
+        l.textColor = [UIColor cyanColor];
         [w.rootViewController.view addSubview:l];
         w.hidden = NO;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8*NSEC_PER_SEC), dispatch_get_main_queue(), ^{ w.hidden = YES; });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6*NSEC_PER_SEC), dispatch_get_main_queue(), ^{ w.hidden = YES; });
         
+        // Keep updating clipboard
         for (int i = 1; i <= 30; i++) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i*2.0*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 [UIPasteboard generalPasteboard].string = _log;
