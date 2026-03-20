@@ -400,7 +400,7 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v33 API SPY ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v34 FAKE LIC ===\n\n"];
     
     // 0. Hook Security framework verify functions
     {
@@ -411,26 +411,28 @@ static void tweak_init(void) {
             [_log appendString:@"[SEC] SecKeyRawVerify found\n"];
         }
         
-        // Replace svp.lic with a DIRECTORY - fopen on a dir returns NULL!
-        // Qt can't recreate the file because the path is occupied by a dir.
+        // Write FAKE svp.lic - PKCS7_verify is patched so any blob passes
         NSString *licPath = [NSHomeDirectory() stringByAppendingPathComponent:
                              @"Library/Application Support/SVPlayer/settings/svp.lic"];
         NSFileManager *fm = [NSFileManager defaultManager];
+        
+        // Remove directory trap if it exists from previous version
         BOOL isDir = NO;
-        if ([fm fileExistsAtPath:licPath isDirectory:&isDir]) {
-            if (!isDir) {
-                // It's a file - delete it and create dir instead
-                [fm removeItemAtPath:licPath error:nil];
-                [fm createDirectoryAtPath:licPath withIntermediateDirectories:YES attributes:nil error:nil];
-                [_log appendString:@"[LIC] Replaced file with DIR ✅\n"];
-            } else {
-                [_log appendString:@"[LIC] Already a DIR ✅\n"];
-            }
-        } else {
-            // Create as directory preemptively
-            [fm createDirectoryAtPath:licPath withIntermediateDirectories:YES attributes:nil error:nil];
-            [_log appendString:@"[LIC] Created DIR trap ✅\n"];
+        if ([fm fileExistsAtPath:licPath isDirectory:&isDir] && isDir) {
+            [fm removeItemAtPath:licPath error:nil];
         }
+        
+        // Create settings dir if needed
+        [fm createDirectoryAtPath:[licPath stringByDeletingLastPathComponent]
+      withIntermediateDirectories:YES attributes:nil error:nil];
+        
+        // Build fake license: base64(PKCS7(license_payload))
+        // The app reads this, calls PKCS7_verify (patched → returns 1),
+        // then extracts the signed data payload
+        NSData *fakeLicReceipt = buildFakeReceipt(@"com.svpteam.svp");
+        NSString *base64Lic = [fakeLicReceipt base64EncodedStringWithOptions:0];
+        [base64Lic writeToFile:licPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        [_log appendFormat:@"[LIC] Wrote fake svp.lic (%lu bytes) ✅\n", (unsigned long)base64Lic.length];
     }
     
     // 1. Verify binary patches
@@ -499,16 +501,13 @@ static void tweak_init(void) {
                           @"Library/Application Support/SVPlayer/settings/svp.lic"];
     for (int i = 1; i <= 60; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 500 * NSEC_PER_MSEC)), dispatch_get_global_queue(0, 0), ^{
-            // Maintain svp.lic directory trap
-            BOOL isD = NO;
-            if ([[NSFileManager defaultManager] fileExistsAtPath:licPath2 isDirectory:&isD]) {
-                if (!isD) {
-                    // Qt somehow wrote a file - replace with dir again
-                    [[NSFileManager defaultManager] removeItemAtPath:licPath2 error:nil];
-                    [[NSFileManager defaultManager] createDirectoryAtPath:licPath2 
-                        withIntermediateDirectories:YES attributes:nil error:nil];
-                    [_log appendFormat:@"[LIC] Re-trapped at %dms ✅\n", i*500];
-                }
+            // Re-write fake svp.lic if Qt overwrote it
+            NSData *licData = [NSData dataWithContentsOfFile:licPath2];
+            if (!licData || licData.length != _globalReceipt.length) {
+                // File missing or changed — re-write fake
+                NSString *b64 = [_globalReceipt base64EncodedStringWithOptions:0];
+                [b64 writeToFile:licPath2 atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                [_log appendFormat:@"[LIC] Re-wrote at %dms ✅\n", i*500];
             }
             
             // Re-patch main.cfg if dummydummy appeared
