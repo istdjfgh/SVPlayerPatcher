@@ -1,96 +1,76 @@
-// SVPlayerPatcher v17 - Bypass receipt crypto validation via interpose
+// SVPlayerPatcher v17b - Crypto bypass
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <StoreKit/StoreKit.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
+#include <mach/mach.h>
+#include <sys/mman.h>
 
 static NSMutableString *_log = nil;
 static BOOL _fakeState = NO;
 
 // ========================================
-// PART 1: Interpose Security framework
+// PART 1: Interpose SecTrust functions
 // ========================================
 
-// Hook SecTrustEvaluateWithError - certificate chain validation
-static bool my_SecTrustEvaluateWithError(SecTrustRef trust, CFErrorRef *error) {
-    [_log appendString:@"[CRYPTO] SecTrustEvaluateWithError -> true\n"];
+static bool my_SecTrustEvalWithErr(SecTrustRef trust, CFErrorRef *error) {
+    [_log appendString:@"[CRYPTO] SecTrustEvalWithErr -> true\n"];
     if (error) *error = NULL;
-    return true; // Always trusted
+    return true;
 }
 
-// Hook SecTrustEvaluate - older API
-static OSStatus my_SecTrustEvaluate(SecTrustRef trust, SecTrustResultType *result) {
-    [_log appendString:@"[CRYPTO] SecTrustEvaluate -> proceed\n"];
+static OSStatus my_SecTrustEval(SecTrustRef trust, SecTrustResultType *result) {
+    [_log appendString:@"[CRYPTO] SecTrustEval -> proceed\n"];
     if (result) *result = kSecTrustResultProceed;
     return errSecSuccess;
 }
 
-// Interpose table
-struct interpose_s { void *replacement; void *original; };
+// Interpose section
+typedef struct { const void *replacement; const void *replacee; } interpose_t;
 
-__attribute__((used, section("__DATA,__interpose")))
-static struct interpose_s interpose_funcs[] = {
-    { (void *)my_SecTrustEvaluateWithError, (void *)SecTrustEvaluateWithError },
-    { (void *)my_SecTrustEvaluate, (void *)SecTrustEvaluate },
+__attribute__((used)) static const interpose_t interps[]
+__attribute__((section("__DATA,__interpose"))) = {
+    { (const void *)my_SecTrustEvalWithErr, (const void *)SecTrustEvaluateWithError },
+    { (const void *)my_SecTrustEval, (const void *)SecTrustEvaluate },
 };
 
 // ========================================
-// PART 2: Hook OpenSSL PKCS7_verify if found
+// PART 2: Scan and patch OpenSSL
 // ========================================
 
-typedef int (*PKCS7_verify_func)(void*, void*, void*, void*, void*, int);
-static PKCS7_verify_func orig_PKCS7_verify = NULL;
-
-static int my_PKCS7_verify(void *p7, void *certs, void *store, void *indata, void *out, int flags) {
-    [_log appendString:@"[CRYPTO] PKCS7_verify -> 1 (success)\n"];
-    return 1; // Success
-}
-
-// Try to hook OpenSSL at runtime
 static void hookOpenSSL(void) {
-    // Look for PKCS7_verify in any loaded library
-    void *sym = dlsym(RTLD_DEFAULT, "PKCS7_verify");
-    if (sym) {
-        orig_PKCS7_verify = (PKCS7_verify_func)sym;
-        [_log appendString:@"[OK] Found PKCS7_verify - patching inline\n"];
-        
-        // Inline patch: replace first instruction with RET (0xD65F03C0 on ARM64)
-        // This makes the function immediately return whatever is in X0 register
-        // We need to make it return 1
-        // ARM64: MOV W0, #1 = 0x52800020; RET = 0xD65F03C0
-        uint32_t *func = (uint32_t *)sym;
-        
-        // Change memory protection
-        vm_address_t page = (vm_address_t)func & ~0xFFF;
-        kern_return_t kr = vm_protect(mach_task_self(), page, 0x1000, FALSE,
-                                      VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-        if (kr == KERN_SUCCESS) {
-            func[0] = 0x52800020; // MOV W0, #1
-            func[1] = 0xD65F03C0; // RET
-            [_log appendString:@"[OK] PKCS7_verify patched!\n"];
-        } else {
-            [_log appendFormat:@"[FAIL] vm_protect: %d\n", kr];
-        }
-    } else {
-        [_log appendString:@"[INFO] No PKCS7_verify found (not using OpenSSL)\n"];
-    }
-    
-    // Also look for other verification functions
-    const char *funcs_to_check[] = {
+    const char *names[] = {
         "PKCS7_verify", "X509_verify_cert", "EVP_VerifyFinal",
-        "ECDSA_verify", "RSA_verify", "EVP_DigestVerifyFinal",
-        NULL
+        "ECDSA_verify", "RSA_verify", "EVP_DigestVerifyFinal", NULL
     };
-    for (int i = 0; funcs_to_check[i]; i++) {
-        void *s = dlsym(RTLD_DEFAULT, funcs_to_check[i]);
-        [_log appendFormat:@"[SCAN] %s = %p\n", funcs_to_check[i], s];
+    
+    for (int i = 0; names[i]; i++) {
+        void *sym = dlsym(RTLD_DEFAULT, names[i]);
+        [_log appendFormat:@"[SCAN] %s = %s\n", names[i], sym ? "FOUND" : "no"];
+        
+        if (sym && (strcmp(names[i], "PKCS7_verify") == 0 ||
+                    strcmp(names[i], "EVP_VerifyFinal") == 0 ||
+                    strcmp(names[i], "EVP_DigestVerifyFinal") == 0)) {
+            // Try to patch: MOV W0, #1; RET
+            uint32_t *fn = (uint32_t *)sym;
+            vm_address_t page = (vm_address_t)fn & ~(vm_address_t)0x3FFF;
+            kern_return_t kr = vm_protect(mach_task_self(), page, 0x4000, FALSE,
+                                          VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+            if (kr == KERN_SUCCESS) {
+                fn[0] = 0x52800020; // MOV W0, #1
+                fn[1] = 0xD65F03C0; // RET
+                [_log appendFormat:@"[PATCH] %s -> return 1\n", names[i]];
+            } else {
+                [_log appendFormat:@"[FAIL] vm_protect %s: %d\n", names[i], kr];
+            }
+        }
     }
 }
 
-// ========================================  
-// PART 3: StoreKit transaction faking
+// ========================================
+// PART 3: StoreKit faking
 // ========================================
 
 static IMP _orig_txState = NULL;
@@ -130,7 +110,6 @@ static IMP _orig_finish = NULL;
 static void hooked_finish(id s, SEL c, id tx) {
     @try { ((void(*)(id,SEL,id))_orig_finish)(s,c,tx); } @catch(NSException *e) {}
 }
-
 static IMP _orig_restored = NULL;
 static void hooked_restored(id s, SEL c, id q) {
     [_log appendString:@"[RESTORE] Done\n"];
@@ -155,12 +134,10 @@ static void patchConfig(void) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v17 - CRYPTO BYPASS ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v17b CRYPTO ===\n\n"];
     
-    // Hook crypto
     hookOpenSSL();
     
-    // Hook StoreKit
     Method m;
     m = class_getInstanceMethod([SKPaymentTransaction class], @selector(transactionState));
     if (m) _orig_txState = method_setImplementation(m, (IMP)hooked_txState);
@@ -172,7 +149,7 @@ static void tweak_init(void) {
     if (m) _orig_origTx = method_setImplementation(m, (IMP)hooked_origTx);
     m = class_getInstanceMethod([SKPaymentQueue class], @selector(finishTransaction:));
     if (m) _orig_finish = method_setImplementation(m, (IMP)hooked_finish);
-    [_log appendString:@"[OK] SK hooks\n"];
+    [_log appendString:@"[OK] SK\n"];
     
     patchConfig();
     
@@ -196,7 +173,7 @@ static void tweak_init(void) {
         w.layer.cornerRadius = 8; w.clipsToBounds = YES;
         w.rootViewController = [[UIViewController alloc] init];
         UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(10, 0, 360, 30)];
-        l.text = @"✅ v17 CRYPTO BYPASS - tap Buy!";
+        l.text = @"✅ v17b CRYPTO - tap Buy then Cancel!";
         l.textColor = [UIColor greenColor];
         l.font = [UIFont boldSystemFontOfSize:13];
         [w.rootViewController.view addSubview:l];
