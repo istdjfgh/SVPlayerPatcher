@@ -1,4 +1,4 @@
-// SVPlayerPatcher v38 - RSA_public_decrypt interpose
+// SVPlayerPatcher v40 - clean, no RSA hook
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <StoreKit/StoreKit.h>
@@ -8,64 +8,6 @@
 static NSMutableString *_log = nil;
 static BOOL _fakeState = NO;
 static NSData *_globalReceipt = nil;
-static int _rsaCallCount = 0;
-
-// ====================================================
-// RSA_public_decrypt INTERPOSE
-// RSA_public_decrypt is used for LICENSE VERIFICATION (decrypt with public key)
-// TLS uses RSA_private_decrypt (different function!) so this is safe to hook globally
-// ====================================================
-
-static int hooked_RSA_public_decrypt(int flen, const unsigned char *from, unsigned char *to, void *rsa, int padding) {
-    _rsaCallCount++;
-    
-    if (_log) {
-        [_log appendFormat:@"[RSA] public_decrypt #%d: flen=%d padding=%d\n", _rsaCallCount, flen, padding];
-        
-        // Log first 16 bytes of input
-        NSMutableString *hex = [NSMutableString string];
-        int n = flen < 16 ? flen : 16;
-        for (int i = 0; i < n; i++) {
-            [hex appendFormat:@"%02X ", from[i]];
-        }
-        [_log appendFormat:@"  input[0..%d]: %@\n", n, hex];
-    }
-    
-    // For RSA-2048 (flen=256) - this is the license decryption
-    if (flen == 256) {
-        // Try multiple formats. SVP might expect email|product_id|timestamp
-        // or a simple string, or JSON
-        const char *fake = "hfr.m.y|user@svp.com|9999999999|1";
-        int len = (int)strlen(fake);
-        memcpy(to, fake, len + 1);
-        
-        if (_log) {
-            [_log appendFormat:@"[RSA] → wrote license '%s' (%d bytes) ✅\n", fake, len];
-            [UIPasteboard generalPasteboard].string = _log;
-        }
-        return len;
-    }
-    
-    // For other calls (flen=584 etc.) - write dummy valid ASN.1 or just return success
-    // Return 1 byte of data
-    to[0] = 0x01;
-    if (_log) {
-        [_log appendFormat:@"[RSA] → flen=%d, wrote 0x01 (passthrough)\n", flen];
-        [UIPasteboard generalPasteboard].string = _log;
-    }
-    return 1;
-}
-
-// DYLD_INTERPOSE macro
-#define DYLD_INTERPOSE(_replacement,_replacee) \
-   __attribute__((used)) static struct{ const void* replacement; const void* replacee; } _interpose_##_replacee \
-   __attribute__((section ("__DATA,__interpose"))) = { (const void*)(unsigned long)&_replacement, (const void*)(unsigned long)&_replacee };
-
-// Declare the original symbol as weak (libmpv exports it at runtime, but we don't link libcrypto)
-extern int RSA_public_decrypt(int flen, const unsigned char *from, unsigned char *to, void *rsa, int padding) __attribute__((weak_import));
-
-// Install the interpose
-DYLD_INTERPOSE(hooked_RSA_public_decrypt, RSA_public_decrypt)
 
 // ====================================================
 // PART 1: Verify binary patch + scan crypto
@@ -458,7 +400,7 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v39 RSA-FMT ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v40 UNLOCK0 ===\n\n"];
     
     // 0. Hook Security framework verify functions
     {
@@ -525,18 +467,18 @@ static void tweak_init(void) {
             if (content && [content containsString:@"dummydummy"]) {
                 // Replace h/pid
                 NSString *patched = [content stringByReplacingOccurrencesOfString:@"\"dummydummy\""
-                                                                      withString:@"\"hfr.m.y\""];
+                                                                      withString:@"\"unlock0\""];
                 [patched writeToFile:cfgPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-                [_log appendString:@"[CFG] Patched h/pid: dummydummy -> hfr.m.y ✅\n"];
-            } else if (content && [content containsString:@"hfr.m.y"]) {
-                [_log appendString:@"[CFG] Already patched (hfr.m.y) ✅\n"];
+                [_log appendString:@"[CFG] Patched h/pid: dummydummy -> unlock0 ✅\n"];
+            } else if (content && [content containsString:@"unlock0"]) {
+                [_log appendString:@"[CFG] Already patched (unlock0) ✅\n"];
             } else {
                 [_log appendFormat:@"[CFG] Exists but no dummydummy found\n"];
             }
         } else {
             // Pre-create with premium values
             NSDictionary *cfg = @{
-                @"h/pid": @"hfr.m.y",
+                @"h/pid": @"unlock0",
                 @"h/uid": [[NSUUID UUID] UUIDString],
                 @"h/last_check": @((long)[[NSDate date] timeIntervalSince1970]),
                 @"dev/fast_render": @YES,
@@ -574,7 +516,7 @@ static void tweak_init(void) {
                 NSString *c = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
                 if (c && [c containsString:@"dummydummy"]) {
                     NSString *p = [c stringByReplacingOccurrencesOfString:@"\"dummydummy\""
-                                                              withString:@"\"hfr.m.y\""];
+                                                              withString:@"\"unlock0\""];
                     [p writeToFile:cfgPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
                     [_log appendFormat:@"[CFG] Re-patched at %dms ✅\n", i*500];
                 }
