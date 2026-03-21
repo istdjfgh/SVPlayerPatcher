@@ -1,14 +1,38 @@
-// SVPlayerPatcher v42 - scan trial/premium classes
+// SVPlayerPatcher v43 - fishhook RSA rebind (main binary only!)
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <StoreKit/StoreKit.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <string.h>
+#import <mach-o/dyld.h>
+#include "fishhook.h"
 
 static NSMutableString *_log = nil;
 static BOOL _fakeState = NO;
 static NSData *_globalReceipt = nil;
+
+// ====================================================
+// RSA_public_decrypt hook via fishhook (main binary ONLY!)
+// This does NOT affect libmpv's TLS - only SVPlayer's license check
+// ====================================================
+
+// Original function pointer (saved by fishhook)
+static int (*orig_RSA_public_decrypt)(int flen, const unsigned char *from,
+                                       unsigned char *to, void *rsa, int padding) = NULL;
+
+static int hooked_RSA_public_decrypt(int flen, const unsigned char *from,
+                                      unsigned char *to, void *rsa, int padding) {
+    // Write "unlock0" as decrypted license data
+    const char *lic = "unlock0";
+    memcpy(to, lic, 8);
+    
+    if (_log) {
+        [_log appendFormat:@"[RSA-HOOK] flen=%d → wrote 'unlock0' ✅\n", flen];
+        [UIPasteboard generalPasteboard].string = _log;
+    }
+    return 7;
+}
 
 // ====================================================
 // PART 1: Verify binary patch + scan crypto
@@ -401,9 +425,31 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v42 SCAN ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v43 FISHHOOK ===\n\n"];
     
-    // 0. Hook Security framework verify functions
+    // 0. FISHHOOK: rebind RSA_public_decrypt ONLY in main binary
+    // This is the KEY - it hooks license verification without breaking TLS
+    {
+        // Get main executable header
+        const struct mach_header *main_header = _dyld_get_image_header(0);
+        intptr_t main_slide = _dyld_get_image_vmaddr_slide(0);
+        
+        struct rebinding rebindings[] = {
+            {"RSA_public_decrypt", (void *)hooked_RSA_public_decrypt, (void **)&orig_RSA_public_decrypt},
+        };
+        
+        int result = rebind_symbols_image((void *)main_header, main_slide, rebindings, 1);
+        [_log appendFormat:@"[FISHHOOK] rebind RSA_public_decrypt in main binary: %s\n",
+         result == 0 ? "SUCCESS ✅" : "FAILED ❌"];
+        
+        if (orig_RSA_public_decrypt) {
+            [_log appendFormat:@"[FISHHOOK] original func saved at %p ✅\n", orig_RSA_public_decrypt];
+        } else {
+            [_log appendString:@"[FISHHOOK] WARNING: orig func is NULL\n"];
+        }
+    }
+    
+    // 0b. Hook Security framework verify functions
     {
         // SecKeyRawVerify -> always errSecSuccess (0)
         void *secSym = dlsym(RTLD_DEFAULT, "SecKeyRawVerify");
