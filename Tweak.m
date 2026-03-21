@@ -1,13 +1,44 @@
-// SVPlayerPatcher v40 - clean, no RSA hook
+// SVPlayerPatcher v41 - 256-byte svp.lic + RSA interpose + ALLOWED reads
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <StoreKit/StoreKit.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
+#import <string.h>
 
 static NSMutableString *_log = nil;
 static BOOL _fakeState = NO;
 static NSData *_globalReceipt = nil;
+static int _rsaCallCount = 0;
+
+// ====================================================
+// RSA_public_decrypt INTERPOSE
+// Now svp.lic reads are ALLOWED (not blocked!)
+// RSA_public_decrypt intercepts to return valid license data
+// ====================================================
+
+static int hooked_RSA_public_decrypt(int flen, const unsigned char *from, unsigned char *to, void *rsa, int padding) {
+    _rsaCallCount++;
+    
+    if (_log && _rsaCallCount <= 10) {
+        [_log appendFormat:@"[RSA] #%d: flen=%d pad=%d\n", _rsaCallCount, flen, padding];
+        [UIPasteboard generalPasteboard].string = _log;
+    }
+    
+    // Write license data: "unlock0" as decrypted content
+    const char *lic = "unlock0";
+    memcpy(to, lic, 8); // 7 chars + null
+    
+    return 7; // length of decrypted data
+}
+
+// DYLD_INTERPOSE macro
+#define DYLD_INTERPOSE(_replacement,_replacee) \
+   __attribute__((used)) static struct{ const void* replacement; const void* replacee; } _interpose_##_replacee \
+   __attribute__((section ("__DATA,__interpose"))) = { (const void*)(unsigned long)&_replacement, (const void*)(unsigned long)&_replacee };
+
+extern int RSA_public_decrypt(int flen, const unsigned char *from, unsigned char *to, void *rsa, int padding) __attribute__((weak_import));
+DYLD_INTERPOSE(hooked_RSA_public_decrypt, RSA_public_decrypt)
 
 // ====================================================
 // PART 1: Verify binary patch + scan crypto
@@ -400,7 +431,7 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v40 UNLOCK0 ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v41 RSA+LIC ===\n\n"];
     
     // 0. Hook Security framework verify functions
     {
@@ -426,13 +457,14 @@ static void tweak_init(void) {
         [fm createDirectoryAtPath:[licPath stringByDeletingLastPathComponent]
       withIntermediateDirectories:YES attributes:nil error:nil];
         
-        // Build fake license: base64(PKCS7(license_payload))
-        // The app reads this, calls PKCS7_verify (patched → returns 1),
-        // then extracts the signed data payload
-        NSData *fakeLicReceipt = buildFakeReceipt(@"com.svpteam.svp");
-        NSString *base64Lic = [fakeLicReceipt base64EncodedStringWithOptions:0];
-        [base64Lic writeToFile:licPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        [_log appendFormat:@"[LIC] Wrote fake svp.lic (%lu bytes) ✅\n", (unsigned long)base64Lic.length];
+        // Write 256-byte svp.lic (RSA-2048 block size)
+        // App calls RSA_public_decrypt on this → our interpose returns "unlock0"
+        unsigned char licBlob[256];
+        memset(licBlob, 0x42, 256); // Fill with dummy data
+        // Write raw binary
+        NSData *licData = [NSData dataWithBytes:licBlob length:256];
+        [licData writeToFile:licPath atomically:YES];
+        [_log appendFormat:@"[LIC] Wrote 256-byte svp.lic ✅\n"];
     }
     
     // 1. Verify binary patches
@@ -503,10 +535,11 @@ static void tweak_init(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 500 * NSEC_PER_MSEC)), dispatch_get_global_queue(0, 0), ^{
             // Re-write fake svp.lic if Qt overwrote it
             NSData *licData = [NSData dataWithContentsOfFile:licPath2];
-            if (!licData || licData.length != _globalReceipt.length) {
-                // File missing or changed — re-write fake
-                NSString *b64 = [_globalReceipt base64EncodedStringWithOptions:0];
-                [b64 writeToFile:licPath2 atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            if (!licData || licData.length != 256) {
+                // File missing or wrong size — re-write 256-byte blob
+                unsigned char blob[256];
+                memset(blob, 0x42, 256);
+                [[NSData dataWithBytes:blob length:256] writeToFile:licPath2 atomically:YES];
                 [_log appendFormat:@"[LIC] Re-wrote at %dms ✅\n", i*500];
             }
             
