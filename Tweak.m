@@ -1,58 +1,15 @@
-// SVPlayerPatcher v43 - fishhook RSA rebind (main binary only!)
+// SVPlayerPatcher v44 - ETERNAL TRIAL (reset trial on every launch)
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <StoreKit/StoreKit.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <string.h>
-#import <mach-o/dyld.h>
-#include "fishhook.h"
+#import <Security/Security.h>
 
 static NSMutableString *_log = nil;
 static BOOL _fakeState = NO;
 static NSData *_globalReceipt = nil;
-
-// ====================================================
-// RSA_public_decrypt hook via fishhook (main binary ONLY!)
-// This does NOT affect libmpv's TLS - only SVPlayer's license check
-// ====================================================
-
-// Original function pointer (saved by fishhook)
-static int (*orig_RSA_public_decrypt)(int flen, const unsigned char *from,
-                                       unsigned char *to, void *rsa, int padding) = NULL;
-
-static int _rsaCallNum = 0;
-
-static int hooked_RSA_public_decrypt(int flen, const unsigned char *from,
-                                      unsigned char *to, void *rsa, int padding) {
-    _rsaCallNum++;
-    
-    // PURE PASSTHROUGH - just log everything, hook NOTHING
-    int result = -1;
-    if (orig_RSA_public_decrypt) {
-        result = orig_RSA_public_decrypt(flen, from, to, rsa, padding);
-    }
-    
-    // Log details (first 20 calls)
-    if (_log && _rsaCallNum <= 20) {
-        NSString *inHex = @"";
-        if (from && flen >= 4) {
-            inHex = [NSString stringWithFormat:@"%02X%02X%02X%02X", from[0], from[1], from[2], from[3]];
-        }
-        NSString *outHex = @"";
-        if (result > 0 && to) {
-            int show = result < 8 ? result : 8;
-            NSMutableString *h = [NSMutableString string];
-            for (int i = 0; i < show; i++) [h appendFormat:@"%02X", to[i]];
-            outHex = h;
-        }
-        [_log appendFormat:@"[RSA#%d] flen=%d pad=%d in=%@ → ret=%d out=%@\n",
-         _rsaCallNum, flen, padding, inHex, result, outHex];
-        [UIPasteboard generalPasteboard].string = _log;
-    }
-    
-    return result;
-}
 
 // ====================================================
 // PART 1: Verify binary patch + scan crypto
@@ -445,62 +402,89 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v43 FISHHOOK ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v44 ETERNAL TRIAL ===\n\n"];
     
-    // 0. FISHHOOK: rebind RSA_public_decrypt ONLY in main binary
-    // This is the KEY - it hooks license verification without breaking TLS
+    // ====================================================
+    // STEP 0: WIPE KEYCHAIN - remove any stored trial dates
+    // ====================================================
     {
-        // Get main executable header
-        const struct mach_header *main_header = _dyld_get_image_header(0);
-        intptr_t main_slide = _dyld_get_image_vmaddr_slide(0);
+        int totalDeleted = 0;
         
-        struct rebinding rebindings[] = {
-            {"RSA_public_decrypt", (void *)hooked_RSA_public_decrypt, (void **)&orig_RSA_public_decrypt},
-        };
+        // Delete ALL GenericPassword items (trial start date likely stored here)
+        NSArray *secClasses = @[
+            (__bridge id)kSecClassGenericPassword,
+            (__bridge id)kSecClassInternetPassword,
+        ];
         
-        int result = rebind_symbols_image((void *)main_header, main_slide, rebindings, 1);
-        [_log appendFormat:@"[FISHHOOK] rebind RSA_public_decrypt in main binary: %s\n",
-         result == 0 ? "SUCCESS ✅" : "FAILED ❌"];
-        
-        if (orig_RSA_public_decrypt) {
-            [_log appendFormat:@"[FISHHOOK] original func saved at %p ✅\n", orig_RSA_public_decrypt];
-        } else {
-            [_log appendString:@"[FISHHOOK] WARNING: orig func is NULL\n"];
+        for (id secClass in secClasses) {
+            NSDictionary *query = @{
+                (__bridge id)kSecClass: secClass,
+            };
+            OSStatus status = SecItemDelete((__bridge CFDictionaryRef)query);
+            if (status == errSecSuccess) {
+                totalDeleted++;
+                [_log appendFormat:@"[KEYCHAIN] Deleted %@ items ✅\n", secClass];
+            } else if (status == errSecItemNotFound) {
+                [_log appendFormat:@"[KEYCHAIN] No %@ items found\n", secClass];
+            } else {
+                [_log appendFormat:@"[KEYCHAIN] Delete %@ error: %d\n", secClass, (int)status];
+            }
+        }
+        [_log appendFormat:@"[KEYCHAIN] Wiped %d classes ✅\n\n", totalDeleted];
+    }
+    
+    // ====================================================
+    // STEP 0b: Hook identifierForVendor → new UUID each launch
+    // ====================================================
+    {
+        Method m = class_getInstanceMethod([UIDevice class], @selector(identifierForVendor));
+        if (m) {
+            method_setImplementation(m, imp_implementationWithBlock(^NSUUID*(id self) {
+                NSUUID *freshUUID = [NSUUID UUID];
+                [_log appendFormat:@"[IDFV] Spoofed → %@\n", [freshUUID UUIDString]];
+                return freshUUID;
+            }));
+            [_log appendString:@"[IDFV] Hook installed ✅\n"];
         }
     }
     
-    // 0b. Hook Security framework verify functions
+    // ====================================================
+    // STEP 0c: DELETE svp.lic (causes failed RSA check → trial reset)
+    // ====================================================
     {
-        // SecKeyRawVerify -> always errSecSuccess (0)
-        void *secSym = dlsym(RTLD_DEFAULT, "SecKeyRawVerify");
-        if (secSym) {
-            // Can't easily hook C functions without fishhook, but we can try method swizzle
-            [_log appendString:@"[SEC] SecKeyRawVerify found\n"];
-        }
-        
-        // Write FAKE svp.lic - PKCS7_verify is patched so any blob passes
         NSString *licPath = [NSHomeDirectory() stringByAppendingPathComponent:
                              @"Library/Application Support/SVPlayer/settings/svp.lic"];
         NSFileManager *fm = [NSFileManager defaultManager];
         
-        // Remove directory trap if it exists from previous version
+        // Remove any existing svp.lic (fake or real)
         BOOL isDir = NO;
-        if ([fm fileExistsAtPath:licPath isDirectory:&isDir] && isDir) {
+        if ([fm fileExistsAtPath:licPath isDirectory:&isDir]) {
             [fm removeItemAtPath:licPath error:nil];
+            [_log appendString:@"[LIC] Deleted svp.lic ✅\n"];
+        } else {
+            [_log appendString:@"[LIC] No svp.lic exists\n"];
         }
         
-        // Create settings dir if needed
+        // Create settings dir
         [fm createDirectoryAtPath:[licPath stringByDeletingLastPathComponent]
       withIntermediateDirectories:YES attributes:nil error:nil];
-        
-        // Write 256-byte svp.lic (RSA-2048 block size)
-        // App calls RSA_public_decrypt on this → our interpose returns "unlock0"
-        unsigned char licBlob[256];
-        memset(licBlob, 0x42, 256); // Fill with dummy data
-        // Write raw binary
-        NSData *licData = [NSData dataWithBytes:licBlob length:256];
-        [licData writeToFile:licPath atomically:YES];
-        [_log appendFormat:@"[LIC] Wrote 256-byte svp.lic ✅\n"];
+    }
+    
+    // ====================================================
+    // STEP 0d: Keep deleting svp.lic in background
+    // ====================================================
+    {
+        NSString *licPath2 = [NSHomeDirectory() stringByAppendingPathComponent:
+                              @"Library/Application Support/SVPlayer/settings/svp.lic"];
+        for (int i = 1; i <= 30; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 1000 * NSEC_PER_MSEC)), dispatch_get_global_queue(0, 0), ^{
+                NSFileManager *fm = [NSFileManager defaultManager];
+                if ([fm fileExistsAtPath:licPath2]) {
+                    [fm removeItemAtPath:licPath2 error:nil];
+                    [_log appendFormat:@"[LIC] Deleted at %ds ✅\n", i];
+                }
+            });
+        }
     }
     
     // 1. Verify binary patches
@@ -563,20 +547,15 @@ static void tweak_init(void) {
     
     patchConfig(); // Patch NOW (before Qt init)
     
-    // DON'T make read-only! Qt needs to READ the file.
     // Keep re-patching if Qt overwrites with dummydummy + keep deleting svp.lic
-    NSString *licPath2 = [NSHomeDirectory() stringByAppendingPathComponent:
+    NSString *licPath3 = [NSHomeDirectory() stringByAppendingPathComponent:
                           @"Library/Application Support/SVPlayer/settings/svp.lic"];
     for (int i = 1; i <= 60; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 500 * NSEC_PER_MSEC)), dispatch_get_global_queue(0, 0), ^{
-            // Re-write fake svp.lic if Qt overwrote it
-            NSData *licData = [NSData dataWithContentsOfFile:licPath2];
-            if (!licData || licData.length != 256) {
-                // File missing or wrong size — re-write 256-byte blob
-                unsigned char blob[256];
-                memset(blob, 0x42, 256);
-                [[NSData dataWithBytes:blob length:256] writeToFile:licPath2 atomically:YES];
-                [_log appendFormat:@"[LIC] Re-wrote at %dms ✅\n", i*500];
+            // Delete svp.lic if it appears (prevent failed RSA check)
+            NSFileManager *fm = [NSFileManager defaultManager];
+            if ([fm fileExistsAtPath:licPath3]) {
+                [fm removeItemAtPath:licPath3 error:nil];
             }
             
             // Re-patch main.cfg if dummydummy appeared
@@ -602,47 +581,25 @@ static void tweak_init(void) {
                 ^NSURLSessionDataTask*(id self, NSURLRequest *request, void (^completion)(NSData*, NSURLResponse*, NSError*)) {
                     NSString *url = request.URL.absoluteString;
                     if ([url containsString:@"svp-team"] || [url containsString:@"svpteam"]) {
-                        [_log appendFormat:@"[API] %@ %@\n", request.HTTPMethod, url];
-                        
-                        // Log request body
-                        NSData *body = request.HTTPBody;
-                        if (body) {
-                            NSString *bodyStr = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
-                            if (bodyStr.length > 300) bodyStr = [bodyStr substringToIndex:300];
-                            [_log appendFormat:@"[API-BODY] %@\n", bodyStr];
-                        }
-                        
-                        // Log headers
-                        NSDictionary *headers = request.allHTTPHeaderFields;
-                        for (NSString *key in headers) {
-                            [_log appendFormat:@"[API-HDR] %@: %@\n", key, headers[key]];
-                        }
-                        
+                        [_log appendFormat:@"[API] BLOCKED: %@ %@\n", request.HTTPMethod, url];
                         [UIPasteboard generalPasteboard].string = _log;
                         
-                        // Wrap completion to log response
-                        void (^wrappedCompletion)(NSData*, NSURLResponse*, NSError*) = ^(NSData *data, NSURLResponse *resp, NSError *err) {
-                            if (err) {
-                                [_log appendFormat:@"[API-ERR] %@\n", err.localizedDescription];
-                            }
-                            if (data) {
-                                NSString *respStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-                                if (!respStr) respStr = [NSString stringWithFormat:@"<binary %lu bytes>", (unsigned long)data.length];
-                                if (respStr.length > 500) respStr = [respStr substringToIndex:500];
-                                [_log appendFormat:@"[API-RESP] %@\n", respStr];
-                            }
-                            NSHTTPURLResponse *httpResp = (NSHTTPURLResponse*)resp;
-                            if ([httpResp isKindOfClass:[NSHTTPURLResponse class]]) {
-                                [_log appendFormat:@"[API-STATUS] %ld\n", (long)httpResp.statusCode];
-                            }
-                            [UIPasteboard generalPasteboard].string = _log;
-                            
-                            if (completion) completion(data, resp, err);
-                        };
-                        
-                        // Let request go through with wrapped completion
+                        // Block license check requests - return empty success
+                        // This prevents server from tracking trial start
+                        if (completion) {
+                            NSHTTPURLResponse *fakeResp = [[NSHTTPURLResponse alloc]
+                                initWithURL:request.URL statusCode:200
+                                HTTPVersion:@"HTTP/1.1" headerFields:@{}];
+                            // Return empty JSON
+                            NSData *emptyData = [@"{}" dataUsingEncoding:NSUTF8StringEncoding];
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                completion(emptyData, fakeResp, nil);
+                            });
+                        }
+                        // Return a dummy task that does nothing
+                        NSURLRequest *dummyReq = [NSURLRequest requestWithURL:[NSURL URLWithString:@"about:blank"]];
                         return ((NSURLSessionDataTask*(*)(id, SEL, NSURLRequest*, id))_orig_task)(
-                            self, @selector(dataTaskWithRequest:completionHandler:), request, wrappedCompletion);
+                            self, @selector(dataTaskWithRequest:completionHandler:), dummyReq, nil);
                     }
                     return ((NSURLSessionDataTask*(*)(id, SEL, NSURLRequest*, id))_orig_task)(
                         self, @selector(dataTaskWithRequest:completionHandler:), request, completion);
@@ -697,11 +654,10 @@ static void tweak_init(void) {
                     [UIPasteboard generalPasteboard].string = _log;
                     return _globalReceipt;
                 }
-                // ALLOW svp.lic reads - let app read our fake license!
+                // BLOCK svp.lic reads - no license = fresh install = new trial
                 if ([path containsString:@"svp.lic"]) {
-                    [_log appendFormat:@"[LIC-READ] ALLOWED svp.lic read ✅\n"];
-                    // Pass through to original - let it read our fake svp.lic
-                    return ((NSData*(*)(id, SEL, NSString*))_orig_dataFile)(self, @selector(initWithContentsOfFile:), path);
+                    [_log appendFormat:@"[LIC-READ] BLOCKED → fresh trial ✅\n"];
+                    return nil; // No license = new trial
                 }
                 // Log SVPlayer file reads
                 if ([path containsString:@"SVPlayer"] || [path containsString:@"svpteam"]) {

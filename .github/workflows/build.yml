@@ -28,7 +28,6 @@ jobs:
             -lobjc \
             -o SVPlayerPatcher.dylib \
             Tweak.m \
-            fishhook.c \
             -target arm64-apple-ios15.0 \
             -fobjc-arc \
             -Wno-unused-function \
