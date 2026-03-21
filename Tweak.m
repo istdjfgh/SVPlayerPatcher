@@ -31,15 +31,29 @@ static int hooked_RSA_public_decrypt(int flen, const unsigned char *from, unsign
         [_log appendFormat:@"  input[0..%d]: %@\n", n, hex];
     }
     
-    // Write "hfr.m.y\0" to output buffer and return 7
-    const char *fake = "hfr.m.y";
-    memcpy(to, fake, 8); // 7 chars + null terminator
+    // For RSA-2048 (flen=256) - this is the license decryption
+    if (flen == 256) {
+        // Try multiple formats. SVP might expect email|product_id|timestamp
+        // or a simple string, or JSON
+        const char *fake = "hfr.m.y|user@svp.com|9999999999|1";
+        int len = (int)strlen(fake);
+        memcpy(to, fake, len + 1);
+        
+        if (_log) {
+            [_log appendFormat:@"[RSA] → wrote license '%s' (%d bytes) ✅\n", fake, len];
+            [UIPasteboard generalPasteboard].string = _log;
+        }
+        return len;
+    }
     
+    // For other calls (flen=584 etc.) - write dummy valid ASN.1 or just return success
+    // Return 1 byte of data
+    to[0] = 0x01;
     if (_log) {
-        [_log appendFormat:@"[RSA] → wrote 'hfr.m.y' ✅\n"];
+        [_log appendFormat:@"[RSA] → flen=%d, wrote 0x01 (passthrough)\n", flen];
         [UIPasteboard generalPasteboard].string = _log;
     }
-    return 7;
+    return 1;
 }
 
 // DYLD_INTERPOSE macro
@@ -444,7 +458,7 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v38 RSA-HOOK ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v39 RSA-FMT ===\n\n"];
     
     // 0. Hook Security framework verify functions
     {
