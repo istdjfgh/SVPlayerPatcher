@@ -27,35 +27,31 @@ static int hooked_RSA_public_decrypt(int flen, const unsigned char *from,
                                       unsigned char *to, void *rsa, int padding) {
     _rsaCallNum++;
     
-    // Log first 8 bytes of input for debugging
-    if (_log && _rsaCallNum <= 10) {
-        NSString *hex = @"";
-        if (from && flen >= 4) {
-            hex = [NSString stringWithFormat:@"%02X%02X%02X%02X", from[0], from[1], from[2], from[3]];
-        }
-        [_log appendFormat:@"[RSA#%d] flen=%d pad=%d in=%@ → ", _rsaCallNum, flen, padding, hex];
-    }
-    
-    // Hook flen=256 (RSA-2048 = license verification)
-    if (flen == 256) {
-        const char *lic = "unlock0";
-        memcpy(to, lic, 8);
-        if (_log && _rsaCallNum <= 10) {
-            [_log appendFormat:@"HOOKED 'unlock0' ✅\n"];
-            [UIPasteboard generalPasteboard].string = _log;
-        }
-        return 7;
-    }
-    
-    // Pass through ALL other sizes to real function
-    if (_log && _rsaCallNum <= 10) {
-        [_log appendFormat:@"PASS ✅\n"];
-    }
-    
+    // PURE PASSTHROUGH - just log everything, hook NOTHING
+    int result = -1;
     if (orig_RSA_public_decrypt) {
-        return orig_RSA_public_decrypt(flen, from, to, rsa, padding);
+        result = orig_RSA_public_decrypt(flen, from, to, rsa, padding);
     }
-    return -1;
+    
+    // Log details (first 20 calls)
+    if (_log && _rsaCallNum <= 20) {
+        NSString *inHex = @"";
+        if (from && flen >= 4) {
+            inHex = [NSString stringWithFormat:@"%02X%02X%02X%02X", from[0], from[1], from[2], from[3]];
+        }
+        NSString *outHex = @"";
+        if (result > 0 && to) {
+            int show = result < 8 ? result : 8;
+            NSMutableString *h = [NSMutableString string];
+            for (int i = 0; i < show; i++) [h appendFormat:@"%02X", to[i]];
+            outHex = h;
+        }
+        [_log appendFormat:@"[RSA#%d] flen=%d pad=%d in=%@ → ret=%d out=%@\n",
+         _rsaCallNum, flen, padding, inHex, result, outHex];
+        [UIPasteboard generalPasteboard].string = _log;
+    }
+    
+    return result;
 }
 
 // ====================================================
