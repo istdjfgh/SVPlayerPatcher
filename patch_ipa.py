@@ -283,41 +283,8 @@ def patch_ipa(ipa_path):
             f.write(data)
         print(f"Patched {patched} crypto functions")
         
-        # ===== SPECIAL PATCH: RSA_public_decrypt → write "hfr.m.y" to output buffer =====
-        # RSA_public_decrypt(int flen, const unsigned char *from, unsigned char *to, RSA *rsa, int padding)
-        # ARM64: x0=flen, x1=from, x2=to, x3=rsa, w4=padding
-        # We replace it with code that writes "hfr.m.y\0" to the 'to' buffer (x2) and returns 7
-        with open(libmpv_path, 'rb') as f:
-            data = bytearray(f.read())
-        
-        rsa_offset = find_symbol_offset(data, 'RSA_public_decrypt')
-        if rsa_offset is not None:
-            # ARM64 instructions to write "hfr.m.y\0" to x2 and return 7:
-            # MOVZ W9, #0x6668          ; load 'hf' (LE)
-            # MOVK W9, #0x2E72, LSL#16 ; load '.r' (LE) -> W9 = 0x2E726668 = "hfr."
-            # STR W9, [X2]             ; store first 4 bytes
-            # MOVZ W9, #0x2E6D         ; load 'm.' (LE)
-            # MOVK W9, #0x0079, LSL#16 ; load 'y\0' (LE) -> W9 = 0x00792E6D = "m.y\0"
-            # STR W9, [X2, #4]         ; store next 4 bytes
-            # MOV W0, #7               ; return length = 7
-            # RET
-            rsa_patch = bytes([
-                0x09, 0xCD, 0x8C, 0x52,  # MOVZ W9, #0x6668
-                0x49, 0xCE, 0xA5, 0x72,  # MOVK W9, #0x2E72, LSL#16
-                0x49, 0x00, 0x00, 0xB9,  # STR W9, [X2]
-                0xA9, 0xCD, 0x85, 0x52,  # MOVZ W9, #0x2E6D
-                0x29, 0x0F, 0xA0, 0x72,  # MOVK W9, #0x0079, LSL#16
-                0x49, 0x04, 0x00, 0xB9,  # STR W9, [X2, #4]
-                0xE0, 0x00, 0x80, 0x52,  # MOV W0, #7
-                0xC0, 0x03, 0x5F, 0xD6,  # RET
-            ])
-            data[rsa_offset:rsa_offset+len(rsa_patch)] = rsa_patch
-            print(f"  PATCH RSA_public_decrypt @ 0x{rsa_offset:X} → writes 'hfr.m.y' + returns 7")
-            
-            with open(libmpv_path, 'wb') as f:
-                f.write(data)
-        else:
-            print("  skip RSA_public_decrypt (not found)")
+        # NOTE: RSA_public_decrypt is hooked at RUNTIME in Tweak.m (not binary-patched)
+        # Binary patching it breaks TLS/networking → error -10
         
         # NOTE: Do NOT patch "dummydummy" string!
         # "dummydummy" is the DEFAULT (not-purchased) value.

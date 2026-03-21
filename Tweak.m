@@ -1,4 +1,4 @@
-// SVPlayerPatcher v32 - fake TX + no DYLD interpose
+// SVPlayerPatcher v38 - RSA_public_decrypt interpose
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <StoreKit/StoreKit.h>
@@ -8,6 +8,50 @@
 static NSMutableString *_log = nil;
 static BOOL _fakeState = NO;
 static NSData *_globalReceipt = nil;
+static int _rsaCallCount = 0;
+
+// ====================================================
+// RSA_public_decrypt INTERPOSE
+// RSA_public_decrypt is used for LICENSE VERIFICATION (decrypt with public key)
+// TLS uses RSA_private_decrypt (different function!) so this is safe to hook globally
+// ====================================================
+
+static int hooked_RSA_public_decrypt(int flen, const unsigned char *from, unsigned char *to, void *rsa, int padding) {
+    _rsaCallCount++;
+    
+    if (_log) {
+        [_log appendFormat:@"[RSA] public_decrypt #%d: flen=%d padding=%d\n", _rsaCallCount, flen, padding];
+        
+        // Log first 16 bytes of input
+        NSMutableString *hex = [NSMutableString string];
+        int n = flen < 16 ? flen : 16;
+        for (int i = 0; i < n; i++) {
+            [hex appendFormat:@"%02X ", from[i]];
+        }
+        [_log appendFormat:@"  input[0..%d]: %@\n", n, hex];
+    }
+    
+    // Write "hfr.m.y\0" to output buffer and return 7
+    const char *fake = "hfr.m.y";
+    memcpy(to, fake, 8); // 7 chars + null terminator
+    
+    if (_log) {
+        [_log appendFormat:@"[RSA] → wrote 'hfr.m.y' ✅\n"];
+        [UIPasteboard generalPasteboard].string = _log;
+    }
+    return 7;
+}
+
+// DYLD_INTERPOSE macro
+#define DYLD_INTERPOSE(_replacement,_replacee) \
+   __attribute__((used)) static struct{ const void* replacement; const void* replacee; } _interpose_##_replacee \
+   __attribute__((section ("__DATA,__interpose"))) = { (const void*)(unsigned long)&_replacement, (const void*)(unsigned long)&_replacee };
+
+// Declare the original symbol from libmpv (linked via libcrypto)
+extern int RSA_public_decrypt(int flen, const unsigned char *from, unsigned char *to, void *rsa, int padding);
+
+// Install the interpose
+DYLD_INTERPOSE(hooked_RSA_public_decrypt, RSA_public_decrypt)
 
 // ====================================================
 // PART 1: Verify binary patch + scan crypto
@@ -400,7 +444,7 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v37 HTTP ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v38 RSA-HOOK ===\n\n"];
     
     // 0. Hook Security framework verify functions
     {
