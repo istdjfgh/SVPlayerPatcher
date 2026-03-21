@@ -23,15 +23,29 @@ static int (*orig_RSA_public_decrypt)(int flen, const unsigned char *from,
 
 static int hooked_RSA_public_decrypt(int flen, const unsigned char *from,
                                       unsigned char *to, void *rsa, int padding) {
-    // Write "unlock0" as decrypted license data
-    const char *lic = "unlock0";
-    memcpy(to, lic, 8);
-    
-    if (_log) {
-        [_log appendFormat:@"[RSA-HOOK] flen=%d → wrote 'unlock0' ✅\n", flen];
-        [UIPasteboard generalPasteboard].string = _log;
+    // ONLY intercept if input looks like our fake svp.lic (256 bytes, starts with 0x42)
+    // All other calls (TLS, etc.) go to original function
+    if (flen == 256 && from && from[0] == 0x42 && from[1] == 0x42) {
+        // This is our fake svp.lic! Write license data
+        const char *lic = "unlock0";
+        memcpy(to, lic, 8);
+        
+        if (_log) {
+            [_log appendFormat:@"[RSA-HOOK] LICENSE flen=%d → 'unlock0' ✅\n", flen];
+            [UIPasteboard generalPasteboard].string = _log;
+        }
+        return 7;
     }
-    return 7;
+    
+    // Pass through to REAL RSA_public_decrypt (TLS, etc.)
+    if (_log) {
+        [_log appendFormat:@"[RSA-PASS] flen=%d (passthrough) ✅\n", flen];
+    }
+    
+    if (orig_RSA_public_decrypt) {
+        return orig_RSA_public_decrypt(flen, from, to, rsa, padding);
+    }
+    return -1; // fallback error
 }
 
 // ====================================================
