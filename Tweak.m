@@ -628,11 +628,11 @@ static void tweak_init(void) {
                     [UIPasteboard generalPasteboard].string = _log;
                     return _globalReceipt;
                 }
-                // Block svp.lic reads - force app to use receipt/config instead
+                // ALLOW svp.lic reads - let app read our fake license!
                 if ([path containsString:@"svp.lic"]) {
-                    [_log appendFormat:@"[LIC-READ] BLOCKED svp.lic read ❌\n"];
-                    [UIPasteboard generalPasteboard].string = _log;
-                    return nil; // File not found
+                    [_log appendFormat:@"[LIC-READ] ALLOWED svp.lic read ✅\n"];
+                    // Pass through to original - let it read our fake svp.lic
+                    return ((NSData*(*)(id, SEL, NSString*))_orig_dataFile)(self, @selector(initWithContentsOfFile:), path);
                 }
                 // Log SVPlayer file reads
                 if ([path containsString:@"SVPlayer"] || [path containsString:@"svpteam"]) {
