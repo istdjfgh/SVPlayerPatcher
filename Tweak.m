@@ -1,4 +1,4 @@
-// SVPlayerPatcher v41 - 256-byte svp.lic + RSA interpose + ALLOWED reads
+// SVPlayerPatcher v42 - scan trial/premium classes
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <StoreKit/StoreKit.h>
@@ -9,36 +9,6 @@
 static NSMutableString *_log = nil;
 static BOOL _fakeState = NO;
 static NSData *_globalReceipt = nil;
-static int _rsaCallCount = 0;
-
-// ====================================================
-// RSA_public_decrypt INTERPOSE
-// Now svp.lic reads are ALLOWED (not blocked!)
-// RSA_public_decrypt intercepts to return valid license data
-// ====================================================
-
-static int hooked_RSA_public_decrypt(int flen, const unsigned char *from, unsigned char *to, void *rsa, int padding) {
-    _rsaCallCount++;
-    
-    if (_log && _rsaCallCount <= 10) {
-        [_log appendFormat:@"[RSA] #%d: flen=%d pad=%d\n", _rsaCallCount, flen, padding];
-        [UIPasteboard generalPasteboard].string = _log;
-    }
-    
-    // Write license data: "unlock0" as decrypted content
-    const char *lic = "unlock0";
-    memcpy(to, lic, 8); // 7 chars + null
-    
-    return 7; // length of decrypted data
-}
-
-// DYLD_INTERPOSE macro
-#define DYLD_INTERPOSE(_replacement,_replacee) \
-   __attribute__((used)) static struct{ const void* replacement; const void* replacee; } _interpose_##_replacee \
-   __attribute__((section ("__DATA,__interpose"))) = { (const void*)(unsigned long)&_replacement, (const void*)(unsigned long)&_replacee };
-
-extern int RSA_public_decrypt(int flen, const unsigned char *from, unsigned char *to, void *rsa, int padding) __attribute__((weak_import));
-DYLD_INTERPOSE(hooked_RSA_public_decrypt, RSA_public_decrypt)
 
 // ====================================================
 // PART 1: Verify binary patch + scan crypto
@@ -431,7 +401,7 @@ static NSURL* hooked_receiptURL(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void tweak_init(void) {
-    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v41 RSA+LIC ===\n\n"];
+    _log = [NSMutableString stringWithString:@"=== SVPlayerPatcher v42 SCAN ===\n\n"];
     
     // 0. Hook Security framework verify functions
     {
@@ -997,10 +967,16 @@ static void tweak_init(void) {
         for (unsigned int i = 0; i < classCount; i++) {
             const char *name = class_getName(classes[i]);
             NSString *cn = [NSString stringWithUTF8String:name];
-            // Only Qt/SVP/IAP classes
+            // Qt/SVP/IAP/License classes
             if (![cn containsString:@"AppStore"] && ![cn containsString:@"InApp"] &&
                 ![cn hasPrefix:@"SVP"] && ![cn containsString:@"Product"] &&
-                ![cn containsString:@"Backend"]) continue;
+                ![cn containsString:@"Backend"] && ![cn containsString:@"Trial"] &&
+                ![cn containsString:@"trial"] && ![cn containsString:@"Regist"] &&
+                ![cn containsString:@"regist"] && ![cn containsString:@"Licens"] &&
+                ![cn containsString:@"licens"] && ![cn containsString:@"Activ"] &&
+                ![cn containsString:@"Premium"] && ![cn containsString:@"premium"] &&
+                ![cn containsString:@"Purchase"] && ![cn containsString:@"Settings"] &&
+                ![cn containsString:@"FRC"] && ![cn containsString:@"About"]) continue;
             // Skip Apple/system classes
             if ([cn hasPrefix:@"ASD"] || [cn hasPrefix:@"FC"] || [cn hasPrefix:@"Fig"] ||
                 [cn hasPrefix:@"LA"] || [cn hasPrefix:@"LS"] || [cn hasPrefix:@"BY"] ||
