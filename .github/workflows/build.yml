@@ -26,12 +26,14 @@ jobs:
             -framework StoreKit \
             -framework Security \
             -lobjc \
+            -undefined dynamic_lookup \
             -o SVPlayerPatcher.dylib \
             Tweak.m \
             -target arm64-apple-ios15.0 \
             -fobjc-arc \
             -Wno-unused-function \
-            -Wno-format
+            -Wno-format \
+            -Wno-deprecated-declarations
           
           codesign -f -s - SVPlayerPatcher.dylib
           

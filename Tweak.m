@@ -47,8 +47,8 @@ static int hooked_RSA_public_decrypt(int flen, const unsigned char *from, unsign
    __attribute__((used)) static struct{ const void* replacement; const void* replacee; } _interpose_##_replacee \
    __attribute__((section ("__DATA,__interpose"))) = { (const void*)(unsigned long)&_replacement, (const void*)(unsigned long)&_replacee };
 
-// Declare the original symbol from libmpv (linked via libcrypto)
-extern int RSA_public_decrypt(int flen, const unsigned char *from, unsigned char *to, void *rsa, int padding);
+// Declare the original symbol as weak (libmpv exports it at runtime, but we don't link libcrypto)
+extern int RSA_public_decrypt(int flen, const unsigned char *from, unsigned char *to, void *rsa, int padding) __attribute__((weak_import));
 
 // Install the interpose
 DYLD_INTERPOSE(hooked_RSA_public_decrypt, RSA_public_decrypt)
