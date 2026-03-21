@@ -21,31 +21,41 @@ static NSData *_globalReceipt = nil;
 static int (*orig_RSA_public_decrypt)(int flen, const unsigned char *from,
                                        unsigned char *to, void *rsa, int padding) = NULL;
 
+static int _rsaCallNum = 0;
+
 static int hooked_RSA_public_decrypt(int flen, const unsigned char *from,
                                       unsigned char *to, void *rsa, int padding) {
-    // ONLY intercept if input looks like our fake svp.lic (256 bytes, starts with 0x42)
-    // All other calls (TLS, etc.) go to original function
-    if (flen == 256 && from && from[0] == 0x42 && from[1] == 0x42) {
-        // This is our fake svp.lic! Write license data
+    _rsaCallNum++;
+    
+    // Log first 8 bytes of input for debugging
+    if (_log && _rsaCallNum <= 10) {
+        NSString *hex = @"";
+        if (from && flen >= 4) {
+            hex = [NSString stringWithFormat:@"%02X%02X%02X%02X", from[0], from[1], from[2], from[3]];
+        }
+        [_log appendFormat:@"[RSA#%d] flen=%d pad=%d in=%@ → ", _rsaCallNum, flen, padding, hex];
+    }
+    
+    // Hook flen=256 (RSA-2048 = license verification)
+    if (flen == 256) {
         const char *lic = "unlock0";
         memcpy(to, lic, 8);
-        
-        if (_log) {
-            [_log appendFormat:@"[RSA-HOOK] LICENSE flen=%d → 'unlock0' ✅\n", flen];
+        if (_log && _rsaCallNum <= 10) {
+            [_log appendFormat:@"HOOKED 'unlock0' ✅\n"];
             [UIPasteboard generalPasteboard].string = _log;
         }
         return 7;
     }
     
-    // Pass through to REAL RSA_public_decrypt (TLS, etc.)
-    if (_log) {
-        [_log appendFormat:@"[RSA-PASS] flen=%d (passthrough) ✅\n", flen];
+    // Pass through ALL other sizes to real function
+    if (_log && _rsaCallNum <= 10) {
+        [_log appendFormat:@"PASS ✅\n"];
     }
     
     if (orig_RSA_public_decrypt) {
         return orig_RSA_public_decrypt(flen, from, to, rsa, padding);
     }
-    return -1; // fallback error
+    return -1;
 }
 
 // ====================================================
