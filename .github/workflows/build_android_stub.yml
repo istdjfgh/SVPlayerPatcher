@@ -22,70 +22,36 @@ jobs:
         run: |
           cat > jni_stub.c << 'EOFCODE'
           #include <jni.h>
-          #include <string.h>
           #include <android/log.h>
 
           #define TAG "TRAJ_STUB"
           #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
           // gstv.aB.a(Class, int)V - string decryptor no-op
-          static void stub_aB_a(JNIEnv *env, jclass clazz, jclass target, jint key) {
+          JNIEXPORT void JNICALL Java_gstv_aB_a__Ljava_lang_Class_2I(JNIEnv *env, jclass clazz, jclass target, jint key) {
               (void)env; (void)clazz; (void)target; (void)key;
           }
 
-          // gstv.K.a()Z - returns boolean, stub returns true
-          static jboolean stub_K_a(JNIEnv *env, jclass clazz) {
+          // gstv.K.a()Z - returns true
+          JNIEXPORT jboolean JNICALL Java_gstv_K_a__(JNIEnv *env, jclass clazz) {
               (void)env; (void)clazz;
               return JNI_TRUE;
           }
 
           // gstv.K.d(gstv.ag)V - no-op
-          static void stub_K_d(JNIEnv *env, jclass clazz, jobject ag) {
+          JNIEXPORT void JNICALL Java_gstv_K_d__Lgstv_ag_2(JNIEnv *env, jclass clazz, jobject ag) {
               (void)env; (void)clazz; (void)ag;
-              LOGI("K.d(ag) called - stub no-op");
+              LOGI("K.d(ag) called - no-op");
           }
 
           // gstv.ag.a(Context, Intent)V - no-op
-          static void stub_ag_a(JNIEnv *env, jobject thiz, jobject ctx, jobject intent) {
+          JNIEXPORT void JNICALL Java_gstv_ag_a__Landroid_content_Context_2Landroid_content_Intent_2(JNIEnv *env, jobject thiz, jobject ctx, jobject intent) {
               (void)env; (void)thiz; (void)ctx; (void)intent;
           }
 
           JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
-              (void)reserved;
-              JNIEnv *env;
-              if ((*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) {
-                  return JNI_VERSION_1_6;
-              }
-              LOGI("JNI stub v2 loaded, registering natives...");
-
-              // gstv.aB: a(Class, int)V
-              jclass abClass = (*env)->FindClass(env, "gstv/aB");
-              if (abClass) {
-                  JNINativeMethod m[] = {{"a", "(Ljava/lang/Class;I)V", (void*)stub_aB_a}};
-                  (*env)->RegisterNatives(env, abClass, m, 1);
-                  LOGI("Registered gstv.aB.a");
-              }
-
-              // gstv.K: a()Z, d(ag)V
-              jclass kClass = (*env)->FindClass(env, "gstv/K");
-              if (kClass) {
-                  JNINativeMethod m[] = {
-                      {"a", "()Z", (void*)stub_K_a},
-                      {"d", "(Lgstv/ag;)V", (void*)stub_K_d}
-                  };
-                  (*env)->RegisterNatives(env, kClass, m, 2);
-                  LOGI("Registered gstv.K.a, gstv.K.d");
-              }
-
-              // gstv.ag: a(Context, Intent)V
-              jclass agClass = (*env)->FindClass(env, "gstv/ag");
-              if (agClass) {
-                  JNINativeMethod m[] = {{"a", "(Landroid/content/Context;Landroid/content/Intent;)V", (void*)stub_ag_a}};
-                  (*env)->RegisterNatives(env, agClass, m, 1);
-                  LOGI("Registered gstv.ag.a");
-              }
-
-              LOGI("All stubs registered OK");
+              (void)vm; (void)reserved;
+              LOGI("JNI stub v3 loaded (JNIEXPORT mode)");
               return JNI_VERSION_1_6;
           }
           EOFCODE
