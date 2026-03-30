@@ -32,6 +32,23 @@ jobs:
               (void)env; (void)clazz; (void)target; (void)key;
           }
 
+          // gstv.x.a(Class, int)V - string decryptor no-op
+          JNIEXPORT void JNICALL Java_gstv_x_a__Ljava_lang_Class_2I(JNIEnv *env, jclass clazz, jclass target, jint key) {
+              (void)env; (void)clazz; (void)target; (void)key;
+          }
+
+          // gstv.x.a(int)String - string lookup, return empty string
+          JNIEXPORT jstring JNICALL Java_gstv_x_a__I(JNIEnv *env, jclass clazz, jint key) {
+              (void)clazz; (void)key;
+              return (*env)->NewStringUTF(env, "");
+          }
+
+          // gstv.x.b(int)I - int lookup, return 0
+          JNIEXPORT jint JNICALL Java_gstv_x_b__I(JNIEnv *env, jclass clazz, jint key) {
+              (void)env; (void)clazz; (void)key;
+              return 0;
+          }
+
           // gstv.K.a()Z - returns true
           JNIEXPORT jboolean JNICALL Java_gstv_K_a__(JNIEnv *env, jclass clazz) {
               (void)env; (void)clazz;
@@ -44,14 +61,71 @@ jobs:
               LOGI("K.d(ag) called - no-op");
           }
 
-          // gstv.ag.a(Context, Intent)V - no-op
+          // gstv.ag.a(Context, Intent)V - no-op (private, instance method)
           JNIEXPORT void JNICALL Java_gstv_ag_a__Landroid_content_Context_2Landroid_content_Intent_2(JNIEnv *env, jobject thiz, jobject ctx, jobject intent) {
               (void)env; (void)thiz; (void)ctx; (void)intent;
           }
 
+          // gstv.G.a(boolean)V - no-op
+          JNIEXPORT void JNICALL Java_gstv_G_a__Z(JNIEnv *env, jclass clazz, jboolean val) {
+              (void)env; (void)clazz; (void)val;
+          }
+
+          // gstv.S.a()V - no-op
+          JNIEXPORT void JNICALL Java_gstv_S_a__(JNIEnv *env, jclass clazz) {
+              (void)env; (void)clazz;
+          }
+
+          // gstv.ae.a(Context, Intent)V - no-op (ae is inner class, JNI name uses gstv_ae)
+          JNIEXPORT void JNICALL Java_gstv_ae_a__Landroid_content_Context_2Landroid_content_Intent_2(JNIEnv *env, jobject thiz, jobject ctx, jobject intent) {
+              (void)env; (void)thiz; (void)ctx; (void)intent;
+          }
+
+          // gstv.aG.a(Context, Intent)V
+          JNIEXPORT void JNICALL Java_gstv_aG_a__Landroid_content_Context_2Landroid_content_Intent_2(JNIEnv *env, jobject thiz, jobject ctx, jobject intent) {
+              (void)env; (void)thiz; (void)ctx; (void)intent;
+          }
+
+          // gstv.u.a(Context, Intent)V
+          JNIEXPORT void JNICALL Java_gstv_u_a__Landroid_content_Context_2Landroid_content_Intent_2(JNIEnv *env, jobject thiz, jobject ctx, jobject intent) {
+              (void)env; (void)thiz; (void)ctx; (void)intent;
+          }
+
+          // gstv.n.a(String, String)V
+          JNIEXPORT void JNICALL Java_gstv_n_a__Ljava_lang_String_2Ljava_lang_String_2(JNIEnv *env, jclass clazz, jstring a, jstring b) {
+              (void)env; (void)clazz; (void)a; (void)b;
+          }
+
+          // gstv.c.a()Z (c.1.smali = gstv.c)
+          JNIEXPORT jboolean JNICALL Java_gstv_c_a__(JNIEnv *env, jclass clazz) {
+              (void)env; (void)clazz;
+              return JNI_FALSE;
+          }
+
+          // gstv.e.a(boolean)V (e.1.smali = gstv.e)
+          JNIEXPORT void JNICALL Java_gstv_e_a__Z(JNIEnv *env, jclass clazz, jboolean val) {
+              (void)env; (void)clazz; (void)val;
+          }
+
+          // gstv.an.a(int)V, b(int)V, c(int)V (an.1.smali = gstv.an)
+          JNIEXPORT void JNICALL Java_gstv_an_a__I(JNIEnv *env, jclass clazz, jint v) {
+              (void)env; (void)clazz; (void)v;
+          }
+          JNIEXPORT void JNICALL Java_gstv_an_b__I(JNIEnv *env, jclass clazz, jint v) {
+              (void)env; (void)clazz; (void)v;
+          }
+          JNIEXPORT void JNICALL Java_gstv_an_c__I(JNIEnv *env, jclass clazz, jint v) {
+              (void)env; (void)clazz; (void)v;
+          }
+
+          // gstv.z.a()V (z.1.smali = gstv.z, private instance)
+          JNIEXPORT void JNICALL Java_gstv_z_a__(JNIEnv *env, jobject thiz) {
+              (void)env; (void)thiz;
+          }
+
           JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
               (void)vm; (void)reserved;
-              LOGI("JNI stub v3 loaded (JNIEXPORT mode)");
+              LOGI("JNI stub v4 loaded - all gstv stubs (JNIEXPORT mode)");
               return JNI_VERSION_1_6;
           }
           EOFCODE
