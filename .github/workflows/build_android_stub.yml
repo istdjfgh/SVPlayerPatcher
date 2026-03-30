@@ -1,0 +1,86 @@
+name: Build ARM64 JNI Stub
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+
+      - name: Create stub source
+        run: |
+          cat > jni_stub.c << 'EOFCODE'
+          #include <jni.h>
+          #include <string.h>
+          #include <android/log.h>
+
+          #define TAG "TRAJ_STUB"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+
+          // gstv.aB.a(Class, int) - string decryptor no-op stub
+          JNIEXPORT void JNICALL Java_gstv_aB_a(JNIEnv *env, jclass clazz, jclass target, jint key) {
+              (void)env; (void)clazz; (void)target; (void)key;
+          }
+
+          JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
+              (void)reserved;
+              JNIEnv *env;
+              if ((*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+                  return JNI_VERSION_1_6;
+              }
+              LOGI("JNI stub loaded, registering natives...");
+              jclass abClass = (*env)->FindClass(env, "gstv/aB");
+              if (abClass != NULL) {
+                  JNINativeMethod methods[] = {
+                      {"a", "(Ljava/lang/Class;I)V", (void*)Java_gstv_aB_a}
+                  };
+                  (*env)->RegisterNatives(env, abClass, methods, 1);
+                  LOGI("Registered gstv.aB.a native method");
+              } else {
+                  LOGI("WARNING: gstv/aB class not found");
+              }
+              return JNI_VERSION_1_6;
+          }
+          EOFCODE
+
+      - name: Compile ARM64 shared library
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          TOOLCHAIN=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64
+          CC=$TOOLCHAIN/bin/aarch64-linux-android21-clang
+          
+          $CC -shared -o libtale_blackwhale.so \
+            -fPIC -O2 -Wall \
+            jni_stub.c \
+            -llog
+          
+          file libtale_blackwhale.so
+          ls -la libtale_blackwhale.so
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-jni-stub
+          path: libtale_blackwhale.so
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-stub-v${{ github.run_number }}
+          name: "ARM64 JNI Stub v${{ github.run_number }}"
+          files: libtale_blackwhale.so
+          body: "ARM64 JNI stub for libtale_blackwhale.so replacement"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
