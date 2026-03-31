@@ -18,42 +18,37 @@ jobs:
         with:
           ndk-version: r26d
 
-      - name: Compile ARM64 shared library
+      - name: Compile ARM64 seccomp bypass
         env:
           NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           TOOLCHAIN=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64
           CC=$TOOLCHAIN/bin/aarch64-linux-android21-clang
-          
-          $CC -shared -o libseccomp_bypass.so \
+
+          $CC -shared -o libexit_noop.so \
             -fPIC -O2 -Wall \
             seccomp_bypass.c \
             -llog
-          
-          file libseccomp_bypass.so
-          ls -la libseccomp_bypass.so
-          
-          # Also build as libexit_noop.so (drop-in replacement)
-          cp libseccomp_bypass.so libexit_noop.so
+
+          file libexit_noop.so
+          ls -la libexit_noop.so
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: seccomp-bypass
-          path: |
-            libseccomp_bypass.so
-            libexit_noop.so
+          path: libexit_noop.so
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: seccomp-bypass-v${{ github.run_number }}
-          name: Seccomp Bypass v${{ github.run_number }}
-          files: |
-            libseccomp_bypass.so
-            libexit_noop.so
+          tag_name: seccomp-bypass-v2-${{ github.run_number }}
+          name: "Seccomp Bypass v2 (smart filter) #${{ github.run_number }}"
+          files: libexit_noop.so
           body: |
-            seccomp-bpf filter that blocks exit/kill/tgkill syscalls.
-            Drop-in replacement for libexit_noop.so.
+            v2: Smart seccomp-bpf filter
+            - exit/exit_group: ALWAYS blocked
+            - kill/tgkill: blocked ONLY for SIGKILL/SIGABRT/SIGTERM
+            - Allows SIGUSR1 etc for GC/thread signals (fixes black screen from v1)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
