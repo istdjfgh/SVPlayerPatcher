@@ -1,0 +1,59 @@
+name: Build Seccomp Bypass SO
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+
+      - name: Compile ARM64 shared library
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          TOOLCHAIN=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64
+          CC=$TOOLCHAIN/bin/aarch64-linux-android21-clang
+          
+          $CC -shared -o libseccomp_bypass.so \
+            -fPIC -O2 -Wall \
+            seccomp_bypass.c \
+            -llog
+          
+          file libseccomp_bypass.so
+          ls -la libseccomp_bypass.so
+          
+          # Also build as libexit_noop.so (drop-in replacement)
+          cp libseccomp_bypass.so libexit_noop.so
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: seccomp-bypass
+          path: |
+            libseccomp_bypass.so
+            libexit_noop.so
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: seccomp-bypass-v${{ github.run_number }}
+          name: Seccomp Bypass v${{ github.run_number }}
+          files: |
+            libseccomp_bypass.so
+            libexit_noop.so
+          body: |
+            seccomp-bpf filter that blocks exit/kill/tgkill syscalls.
+            Drop-in replacement for libexit_noop.so.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
