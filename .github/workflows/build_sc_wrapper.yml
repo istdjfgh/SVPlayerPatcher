@@ -1,0 +1,141 @@
+name: Build ARM64 Supercell Wrapper
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+
+      - name: Create wrapper source
+        run: |
+          cat > sc_wrapper.c << 'EOFCODE'
+          #include <jni.h>
+          #include <dlfcn.h>
+          #include <android/log.h>
+          #include <stdlib.h>
+          #include <unistd.h>
+          #include <signal.h>
+          #include <string.h>
+
+          #define TAG "SC_WRAP"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+          // Store original function pointers
+          static void *orig_handle = NULL;
+          static void *gadget_handle = NULL;
+
+          // Original exit/kill for blocking
+          typedef void (*exit_func_t)(int);
+          typedef void (*_exit_func_t)(int);
+          typedef int (*kill_func_t)(int, int);
+
+          static exit_func_t orig_exit = NULL;
+          static _exit_func_t orig__exit = NULL;
+          static kill_func_t orig_kill = NULL;
+          static int my_pid = 0;
+          static int exit_blocked = 0;
+
+          // Override exit() - will be called by anti-tamper
+          void exit(int status) {
+              LOGI("exit(%d) BLOCKED by wrapper!", status);
+              exit_blocked++;
+              // Don't actually exit - just return
+              // The caller (in a thread) will return and the thread will end
+              while(1) { sleep(86400); } // Block this thread forever
+          }
+
+          void _exit(int status) {
+              LOGI("_exit(%d) BLOCKED by wrapper!", status);
+              exit_blocked++;
+              while(1) { sleep(86400); }
+          }
+
+          // Constructor - runs BEFORE JNI_OnLoad
+          __attribute__((constructor))
+          static void wrapper_init(void) {
+              my_pid = getpid();
+              LOGI("=== SC Wrapper constructor, PID=%d ===", my_pid);
+              
+              // Try to load Frida Gadget
+              LOGI("Loading libfrida-gadget.so...");
+              gadget_handle = dlopen("libfrida-gadget.so", RTLD_NOW);
+              if (gadget_handle) {
+                  LOGI("Frida Gadget loaded successfully!");
+              } else {
+                  LOGE("Failed to load Frida Gadget: %s", dlerror());
+              }
+              
+              LOGI("Constructor done, proceeding to JNI_OnLoad...");
+          }
+
+          JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
+              LOGI("=== Wrapper JNI_OnLoad ===");
+              
+              // Load original libsupercell
+              LOGI("Loading libsupercell_orig.so...");
+              orig_handle = dlopen("libsupercell_orig.so", RTLD_NOW);
+              if (!orig_handle) {
+                  LOGE("Failed to load orig: %s", dlerror());
+                  return JNI_VERSION_1_6;
+              }
+              LOGI("Original loaded at %p", orig_handle);
+              
+              // Find and call original JNI_OnLoad
+              typedef jint (*JNI_OnLoad_t)(JavaVM*, void*);
+              JNI_OnLoad_t orig_onload = (JNI_OnLoad_t)dlsym(orig_handle, "JNI_OnLoad");
+              if (!orig_onload) {
+                  LOGE("JNI_OnLoad not found in original!");
+                  return JNI_VERSION_1_6;
+              }
+              
+              LOGI("Calling original JNI_OnLoad...");
+              jint result = orig_onload(vm, reserved);
+              LOGI("Original JNI_OnLoad returned %d, exit_blocked=%d", result, exit_blocked);
+              
+              return result;
+          }
+          EOFCODE
+
+      - name: Compile ARM64 shared library
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          TOOLCHAIN=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64
+          CC=$TOOLCHAIN/bin/aarch64-linux-android24-clang
+          
+          $CC -shared -o libsupercell_brawlstars.so \
+            -fPIC -O2 -Wall \
+            sc_wrapper.c \
+            -llog -ldl
+          
+          file libsupercell_brawlstars.so
+          ls -la libsupercell_brawlstars.so
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sc-wrapper
+          path: libsupercell_brawlstars.so
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sc-wrapper-v${{ github.run_number }}
+          name: "SC Wrapper v${{ github.run_number }}"
+          files: libsupercell_brawlstars.so
+          body: "ARM64 wrapper for libsupercell_brawlstars.so - loads Frida Gadget before original, overrides exit()"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
