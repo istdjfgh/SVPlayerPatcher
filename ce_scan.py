@@ -19,8 +19,12 @@ LIBG_BASE = 0x53c0000
 LIBG_SIZE = 0x1200000
 LOCAL_DIR = r'D:\brawl\BrawlStrars_Mod\ce_snapshots'
 DEVICE_SCRIPT = '/data/local/tmp/memdump.sh'
+DEVICE_BINARY = '/data/local/tmp/memdump'  # native binary (preferred)
 DEVICE_SNAP_DIR = '/data/local/tmp'
 SCRIPT_SRC = os.path.join(os.path.dirname(__file__), 'memdump.sh')
+BINARY_SRC = os.path.join(os.path.dirname(__file__), 'memdump')  # compiled binary
+
+use_native = False  # set True when native binary is available
 
 
 class Snapshot:
@@ -63,12 +67,41 @@ def get_pid():
         return 0
 
 
-def push_script():
+def push_dumper():
+    """Push memdump binary or shell script to device."""
+    global use_native
+    
+    # Try native binary first
+    if os.path.exists(BINARY_SRC):
+        with open(BINARY_SRC, 'rb') as f:
+            data = f.read()
+        b64 = base64.b64encode(data).decode()
+        # Split into chunks if too large for single echo
+        chunk_size = 65000
+        if len(b64) <= chunk_size:
+            adb('shell', f"su -c 'echo {b64} | base64 -d > {DEVICE_BINARY} && chmod 755 {DEVICE_BINARY}'")
+        else:
+            adb('shell', f"su -c 'rm -f {DEVICE_BINARY}'")
+            for i in range(0, len(b64), chunk_size):
+                chunk = b64[i:i+chunk_size]
+                adb('shell', f"su -c 'echo {chunk} | base64 -d >> {DEVICE_BINARY}'")
+            adb('shell', f"su -c 'chmod 755 {DEVICE_BINARY}'")
+        # Verify
+        out = adb('shell', f"su -c 'file {DEVICE_BINARY} 2>/dev/null || echo unknown'")
+        if 'ELF' in out or 'executable' in out:
+            use_native = True
+            print(f"  Pushed native memdump ({len(data)} bytes)")
+            return
+        else:
+            print(f"  Native binary push failed ({out}), falling back to shell")
+    
+    # Fallback to shell script
     with open(SCRIPT_SRC, 'rb') as f:
         data = f.read()
     b64 = base64.b64encode(data).decode()
     adb('shell', f"su -c 'echo {b64} | base64 -d > {DEVICE_SCRIPT} && chmod 755 {DEVICE_SCRIPT}'")
-    print(f"  Pushed memdump.sh")
+    use_native = False
+    print(f"  Pushed memdump.sh (shell fallback)")
 
 
 def take_and_pull(pid, slot):
@@ -79,7 +112,10 @@ def take_and_pull(pid, slot):
     local_idx = os.path.join(LOCAL_DIR, f'{slot}.idx')
 
     t0 = time.time()
-    out = adb('shell', f"su -c 'sh {DEVICE_SCRIPT} {pid} {dev_bin}'")
+    if use_native:
+        out = adb('shell', f"su -c '{DEVICE_BINARY} {pid} {dev_bin}'")
+    else:
+        out = adb('shell', f"su -c 'sh {DEVICE_SCRIPT} {pid} {dev_bin}'")
     t_dump = time.time() - t0
 
     t1 = time.time()
@@ -250,7 +286,7 @@ def main():
         return
     print(f"Brawl Stars PID: {pid}")
 
-    push_script()
+    push_dumper()
 
     print()
     print("=== MEMORY SCANNER v5 (numpy, ~5s/scan) ===")

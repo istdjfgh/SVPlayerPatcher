@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <errno.h>
 
 #define MAX_REGIONS 1024
@@ -136,7 +137,6 @@ int main(int argc, char *argv[]) {
     }
 
     unsigned long file_off = 0;
-    unsigned long written = 0;
 
     for (int i = 0; i < nmerged; i++) {
         unsigned long rstart = merged[i].start;
@@ -171,7 +171,6 @@ int main(int argc, char *argv[]) {
             }
             fwrite(buf, 1, rd, out);
             remaining -= rd;
-            written += rd;
         }
         file_off += rsize;
     }
