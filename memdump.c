@@ -21,7 +21,7 @@
 #define MIN_ADDR  0x05000000UL
 #define MAX_ADDR  0x7F000000UL
 #define MIN_SIZE  4096
-#define MAX_SIZE  (32 * 1024 * 1024)
+#define MAX_SIZE  (512 * 1024 * 1024)
 #define MERGE_GAP 65536  /* merge regions with gap <= 64KB */
 
 struct region {
