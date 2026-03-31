@@ -1,0 +1,102 @@
+name: Build Zygisk Module
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+
+      - name: Download zygisk.hpp
+        run: |
+          curl -sL "https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp" -o zygisk.hpp
+          head -5 zygisk.hpp
+
+      - name: Compile Zygisk module for x86_64
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          TOOLCHAIN=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64
+          CXX=$TOOLCHAIN/bin/x86_64-linux-android21-clang++
+
+          $CXX -shared -o x86_64.so \
+            -fPIC -O2 -Wall -std=c++17 \
+            -I. \
+            zygisk_module.cpp \
+            -llog -ldl
+
+          file x86_64.so
+          ls -la x86_64.so
+
+      - name: Compile for ARM64 too
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          TOOLCHAIN=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64
+          CXX=$TOOLCHAIN/bin/aarch64-linux-android21-clang++
+
+          $CXX -shared -o arm64-v8a.so \
+            -fPIC -O2 -Wall -std=c++17 \
+            -I. \
+            zygisk_module.cpp \
+            -llog -ldl
+
+          file arm64-v8a.so
+          ls -la arm64-v8a.so
+
+      - name: Package Magisk module
+        run: |
+          mkdir -p module/zygisk
+          cp x86_64.so module/zygisk/x86_64.so
+          cp arm64-v8a.so module/zygisk/arm64-v8a.so
+
+          cat > module/module.prop << 'PROP'
+          id=brawl_seccomp_bypass
+          name=Brawl Stars Seccomp Bypass
+          version=v3.0
+          versionCode=3
+          author=mod
+          description=Injects seccomp filter to bypass Promon SHIELD in Brawl Stars
+          PROP
+
+          sed -i 's/^[[:space:]]*//' module/module.prop
+          cat module/module.prop
+
+          cd module && zip -r ../brawl_bypass_zygisk.zip . && cd ..
+          ls -la brawl_bypass_zygisk.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zygisk-module
+          path: |
+            brawl_bypass_zygisk.zip
+            x86_64.so
+            arm64-v8a.so
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: zygisk-v3-${{ github.run_number }}
+          name: "Zygisk Seccomp Bypass v3 #${{ github.run_number }}"
+          files: |
+            brawl_bypass_zygisk.zip
+            x86_64.so
+            arm64-v8a.so
+          body: |
+            Zygisk module - seccomp-bpf filter for Brawl Stars.
+            No APK modification needed - works with original APKs.
+            Blocks exit/exit_group/fork/kill(deadly signals) at kernel level.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
