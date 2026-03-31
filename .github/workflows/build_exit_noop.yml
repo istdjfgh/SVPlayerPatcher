@@ -1,0 +1,53 @@
+name: Build Exit Noop Library
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+          
+      - name: Create source
+        run: |
+          cat > exit_noop.c << 'CEOF'
+          #include <unistd.h>
+          
+          void exit(int status) {
+              while(1) { usleep(1000000); }
+          }
+          
+          void _exit(int status) {
+              while(1) { usleep(1000000); }
+          }
+          
+          void _Exit(int status) {
+              while(1) { usleep(1000000); }
+          }
+          
+          void abort(void) {
+              while(1) { usleep(1000000); }
+          }
+          
+          int tgkill(int tgid, int tid, int sig) {
+              return 0;
+          }
+          CEOF
+          
+      - name: Compile ARM64 shared library
+        run: |
+          ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang \
+            -shared -fPIC -O2 -o libexit_noop.so exit_noop.c
+          file libexit_noop.so
+          ls -la libexit_noop.so
+          
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libexit_noop
+          path: libexit_noop.so
