@@ -1,0 +1,49 @@
+name: Build memdump binary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+
+      - name: Compile memdump for x86_64 (static)
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          TOOLCHAIN=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64
+          CC=$TOOLCHAIN/bin/x86_64-linux-android21-clang
+
+          $CC -static -O2 -Wall -o memdump memdump.c
+          file memdump
+          ls -la memdump
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: memdump
+          path: memdump
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: memdump-v1-${{ github.run_number }}
+          name: "memdump native binary #${{ github.run_number }}"
+          files: memdump
+          body: |
+            Native x86_64 Android static binary for fast memory dumping.
+            Usage: memdump <PID> <output_file>
+            Replaces slow shell-based memdump.sh.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
