@@ -465,126 +465,130 @@ static int cmd_newpairs(const char *snap1, const char *snap2,
 }
 
 /*
- * Command: bindiff - streaming binary diff of two same-size snapshots
- * Reads both files sequentially, finds bytes that changed,
- * and for changed locations checks if snap2 now contains a coord pair.
- * Also reports: positions where snap1 was NOT a coord pair but snap2 IS.
+ * Command: bindiff - region-aware binary diff of two snapshots
+ * Uses idx files to match regions by virtual address.
+ * Only compares regions that exist in BOTH snapshots.
  *
  * Output modes:
- *   "all"   - report ALL changed float pairs in snap2
+ *   "all"   - report ALL changed float pairs
  *   "new"   - report only NEW coord pairs (was NOT coord in snap1, IS coord in snap2)
  *   "gone"  - report only GONE coord pairs (WAS coord in snap1, is NOT in snap2)
- *   "count" - just count total changes, new pairs, gone pairs
+ *   "count" - just count
  */
 static int cmd_bindiff(const char *snap1, const char *snap2,
                        const char *report_mode,
                        float minX, float maxX, float minY, float maxY) {
-    /* Parse idx files for vaddr mapping */
     char idx1_path[512], idx2_path[512];
     snprintf(idx1_path, sizeof(idx1_path), "%s.idx", snap1);
     snprintf(idx2_path, sizeof(idx2_path), "%s.idx", snap2);
 
-    struct { uint64_t vaddr; uint64_t size; uint64_t foff; } idx[MAX_REGIONS];
-    int nidx = 0;
+    /* Parse both idx files */
+    struct idxentry { uint64_t vaddr; uint64_t size; uint64_t foff; };
+    static struct idxentry ix1[MAX_REGIONS], ix2[MAX_REGIONS];
+    int n1 = 0, n2 = 0;
 
-    FILE *idxf = fopen(idx2_path, "r");
-    if (!idxf) idxf = fopen(idx1_path, "r");
-    if (idxf) {
-        while (nidx < MAX_REGIONS) {
-            uint64_t a, s, o;
-            if (fscanf(idxf, "%" SCNx64 " %" SCNu64 " %" SCNu64, &a, &s, &o) != 3)
-                break;
-            idx[nidx].vaddr = a;
-            idx[nidx].size = s;
-            idx[nidx].foff = o;
-            nidx++;
-        }
-        fclose(idxf);
-    }
+    FILE *f;
+    f = fopen(idx1_path, "r");
+    if (!f) { fprintf(stderr, "Cannot open %s\n", idx1_path); return 1; }
+    while (n1 < MAX_REGIONS && fscanf(f, "%" SCNx64 " %" SCNu64 " %" SCNu64,
+           &ix1[n1].vaddr, &ix1[n1].size, &ix1[n1].foff) == 3) n1++;
+    fclose(f);
 
-    FILE *f1 = fopen(snap1, "rb");
-    FILE *f2 = fopen(snap2, "rb");
-    if (!f1 || !f2) {
+    f = fopen(idx2_path, "r");
+    if (!f) { fprintf(stderr, "Cannot open %s\n", idx2_path); return 1; }
+    while (n2 < MAX_REGIONS && fscanf(f, "%" SCNx64 " %" SCNu64 " %" SCNu64,
+           &ix2[n2].vaddr, &ix2[n2].size, &ix2[n2].foff) == 3) n2++;
+    fclose(f);
+
+    int fd1 = open(snap1, O_RDONLY);
+    int fd2 = open(snap2, O_RDONLY);
+    if (fd1 < 0 || fd2 < 0) {
         fprintf(stderr, "Cannot open snapshot files\n");
-        if (f1) fclose(f1);
-        if (f2) fclose(f2);
+        if (fd1 >= 0) close(fd1);
+        if (fd2 >= 0) close(fd2);
         return 1;
     }
 
     int mode_all = (strcmp(report_mode, "all") == 0);
     int mode_new = (strcmp(report_mode, "new") == 0);
     int mode_gone = (strcmp(report_mode, "gone") == 0);
-    int mode_count = (strcmp(report_mode, "count") == 0);
+    /* int mode_count = (strcmp(report_mode, "count") == 0); */
 
     static char b1[BUF_SIZE], b2[BUF_SIZE];
-    uint64_t file_off = 0;
-    int total_changes = 0;
-    int new_pairs = 0;
-    int gone_pairs = 0;
-    int changed_pairs = 0;
+    int total_changes = 0, new_pairs = 0, gone_pairs = 0, changed_pairs = 0;
+    uint64_t total_compared = 0;
 
-    while (1) {
-        size_t r1 = fread(b1, 1, BUF_SIZE, f1);
-        size_t r2 = fread(b2, 1, BUF_SIZE, f2);
-        size_t rd = (r1 < r2) ? r1 : r2;
-        if (rd < 8) break;
-
-        /* Scan for changed dwords */
-        for (size_t j = 0; j + 7 < rd; j += 4) {
-            /* Quick check: did anything change in this 8-byte window? */
-            if (memcmp(b1 + j, b2 + j, 8) == 0) continue;
-
-            total_changes++;
-
-            float x1, y1, x2, y2;
-            memcpy(&x1, b1 + j, 4); memcpy(&y1, b1 + j + 4, 4);
-            memcpy(&x2, b2 + j, 4); memcpy(&y2, b2 + j + 4, 4);
-
-            int was_coord = is_coord(x1, minX, maxX) && is_coord(y1, minY, maxY);
-            int is_coord_now = is_coord(x2, minX, maxX) && is_coord(y2, minY, maxY);
-
-            /* Resolve virtual address */
-            uint64_t vaddr = file_off + j; /* default: file offset */
-            for (int k = 0; k < nidx; k++) {
-                if (file_off + j >= idx[k].foff &&
-                    file_off + j < idx[k].foff + idx[k].size) {
-                    vaddr = idx[k].vaddr + (file_off + j - idx[k].foff);
-                    break;
-                }
-            }
-
-            if (is_coord_now && !was_coord) {
-                new_pairs++;
-                if (mode_new || mode_all) {
-                    printf("NEW %" PRIx64 " %.3f,%.3f -> %.3f,%.3f\n",
-                           vaddr, x1, y1, x2, y2);
-                }
-            }
-            else if (was_coord && !is_coord_now) {
-                gone_pairs++;
-                if (mode_gone || mode_all) {
-                    printf("GONE %" PRIx64 " %.3f,%.3f -> %.3f,%.3f\n",
-                           vaddr, x1, y1, x2, y2);
-                }
-            }
-            else if (is_coord_now && was_coord) {
-                changed_pairs++;
-                if (mode_all) {
-                    printf("CHG %" PRIx64 " %.3f,%.3f -> %.3f,%.3f\n",
-                           vaddr, x1, y1, x2, y2);
-                }
-            }
+    /* For each region in snap2, find matching region in snap1 by vaddr */
+    for (int r2 = 0; r2 < n2; r2++) {
+        int r1 = -1;
+        for (int k = 0; k < n1; k++) {
+            if (ix1[k].vaddr == ix2[r2].vaddr) { r1 = k; break; }
         }
+        if (r1 < 0) continue; /* Region only in snap2, skip */
 
-        file_off += rd;
+        uint64_t cmp_size = ix1[r1].size < ix2[r2].size ? ix1[r1].size : ix2[r2].size;
+        uint64_t vbase = ix2[r2].vaddr;
+
+        /* Seek both files to region start */
+        lseek64(fd1, (off64_t)ix1[r1].foff, SEEK_SET);
+        lseek64(fd2, (off64_t)ix2[r2].foff, SEEK_SET);
+
+        uint64_t offset = 0;
+        while (offset < cmp_size) {
+            uint64_t toread = cmp_size - offset;
+            if (toread > BUF_SIZE) toread = BUF_SIZE;
+
+            ssize_t rd1 = read(fd1, b1, (size_t)toread);
+            ssize_t rd2 = read(fd2, b2, (size_t)toread);
+            ssize_t rd = (rd1 < rd2) ? rd1 : rd2;
+            if (rd < 8) break;
+
+            for (ssize_t j = 0; j + 7 < rd; j += 4) {
+                if (memcmp(b1 + j, b2 + j, 8) == 0) continue;
+
+                total_changes++;
+
+                float x1, y1, x2, y2;
+                memcpy(&x1, b1 + j, 4); memcpy(&y1, b1 + j + 4, 4);
+                memcpy(&x2, b2 + j, 4); memcpy(&y2, b2 + j + 4, 4);
+
+                int was = is_coord(x1, minX, maxX) && is_coord(y1, minY, maxY);
+                int now = is_coord(x2, minX, maxX) && is_coord(y2, minY, maxY);
+
+                uint64_t vaddr = vbase + offset + j;
+
+                if (now && !was) {
+                    new_pairs++;
+                    if (mode_new || mode_all)
+                        printf("NEW %" PRIx64 " %.3f,%.3f -> %.3f,%.3f\n",
+                               vaddr, x1, y1, x2, y2);
+                }
+                else if (was && !now) {
+                    gone_pairs++;
+                    if (mode_gone || mode_all)
+                        printf("GONE %" PRIx64 " %.3f,%.3f -> %.3f,%.3f\n",
+                               vaddr, x1, y1, x2, y2);
+                }
+                else if (now && was) {
+                    changed_pairs++;
+                    if (mode_all)
+                        printf("CHG %" PRIx64 " %.3f,%.3f -> %.3f,%.3f\n",
+                               vaddr, x1, y1, x2, y2);
+                }
+            }
+
+            offset += rd;
+            total_compared += rd;
+        }
     }
 
-    fclose(f1);
-    fclose(f2);
+    close(fd1);
+    close(fd2);
 
-    fprintf(stderr, "Scanned %" PRIu64 "MB, %d changed 8-byte windows\n",
-            file_off / (1024*1024), total_changes);
-    fprintf(stderr, "NEW: %d, GONE: %d, CHG: %d\n", new_pairs, gone_pairs, changed_pairs);
+    fprintf(stderr, "Compared %" PRIu64 "MB across matching regions\n",
+            total_compared / (1024*1024));
+    fprintf(stderr, "%d changed windows, NEW: %d, GONE: %d, CHG: %d\n",
+            total_changes, new_pairs, gone_pairs, changed_pairs);
     return 0;
 }
 
