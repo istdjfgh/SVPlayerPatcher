@@ -29,21 +29,18 @@ jobs:
           file memdump
           ls -la memdump
 
-      - name: Upload artifact
+          $CC -static -O2 -Wall -o memscan memscan.c -lm
+          file memscan
+          ls -la memscan
+
+      - name: Upload memdump artifact
         uses: actions/upload-artifact@v4
         with:
           name: memdump
           path: memdump
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload memscan artifact
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: memdump-v1-${{ github.run_number }}
-          name: "memdump native binary #${{ github.run_number }}"
-          files: memdump
-          body: |
-            Native x86_64 Android static binary for fast memory dumping.
-            Usage: memdump <PID> <output_file>
-            Replaces slow shell-based memdump.sh.
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: memscan
+          path: memscan
