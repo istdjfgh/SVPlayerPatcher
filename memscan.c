@@ -655,6 +655,9 @@ static int cmd_snapfind(const char *snapfile, float targetX, float targetY,
                 memcpy(&x, sbuf + j, 4);
                 memcpy(&y, sbuf + j + 4, 4);
 
+                /* Must be valid floats (not NaN/Inf) AND within tolerance */
+                if (isnan(x) || isinf(x) || isnan(y) || isinf(y))
+                    continue;
                 if (fabsf(x - targetX) > tolerance || fabsf(y - targetY) > tolerance)
                     continue;
 
@@ -775,6 +778,8 @@ static int cmd_livefind(int pid, int nmerged, float targetX, float targetY,
                 memcpy(&x, buf + j, 4);
                 memcpy(&y, buf + j + 4, 4);
 
+                if (isnan(x) || isinf(x) || isnan(y) || isinf(y))
+                    continue;
                 if (fabsf(x - targetX) > tolerance || fabsf(y - targetY) > tolerance)
                     continue;
 
