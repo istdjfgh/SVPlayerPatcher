@@ -592,6 +592,255 @@ static int cmd_bindiff(const char *snap1, const char *snap2,
     return 0;
 }
 
+/*
+ * Command: snapfind - search snapshot file for a specific float pair
+ * and dump context around each match.
+ * 
+ * Useful for finding the REAL projectile struct when you know
+ * the approximate Current X/Y values from bindiff.
+ *
+ * Usage: memscan 0 0 snapfind <snapfile> <targetX> <targetY> <tolerance> <context_words>
+ *   targetX/Y: float values to search for (e.g. 869.33 1169.36)
+ *   tolerance: max diff for match (e.g. 0.5)
+ *   context_words: how many 4-byte words to dump before/after match (e.g. 64 = 256 bytes)
+ *
+ * For each match, prints:
+ *   MATCH <vaddr> <file_offset> <X> <Y>
+ *   then context_words*2+1 lines of:
+ *     CTX <vaddr> <offset_from_match> <float_value> <uint32_value> <notes>
+ */
+static int cmd_snapfind(const char *snapfile, float targetX, float targetY,
+                        float tolerance, int ctx_words) {
+    char idxpath[512];
+    snprintf(idxpath, sizeof(idxpath), "%s.idx", snapfile);
+
+    /* Parse idx */
+    struct idxentry { uint64_t vaddr; uint64_t size; uint64_t foff; };
+    static struct idxentry ix[MAX_REGIONS];
+    int nix = 0;
+    FILE *f = fopen(idxpath, "r");
+    if (!f) { fprintf(stderr, "Cannot open %s\n", idxpath); return 1; }
+    while (nix < MAX_REGIONS && fscanf(f, "%" SCNx64 " %" SCNu64 " %" SCNu64,
+           &ix[nix].vaddr, &ix[nix].size, &ix[nix].foff) == 3) nix++;
+    fclose(f);
+
+    int fd = open(snapfile, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "Cannot open %s\n", snapfile); return 1; }
+
+    /* We'll skip addresses in the known render buffer region to avoid duplicates */
+    uint64_t skip_min = 0x763869190000ULL;
+    uint64_t skip_max = 0x76386919FFFFULL;
+
+    int found = 0;
+    static char sbuf[BUF_SIZE];
+
+    for (int r = 0; r < nix; r++) {
+        uint64_t vbase = ix[r].vaddr;
+        uint64_t rsize = ix[r].size;
+        uint64_t fbase = ix[r].foff;
+
+        if (lseek64(fd, (off64_t)fbase, SEEK_SET) == (off64_t)-1)
+            continue;
+
+        uint64_t offset = 0;
+        while (offset < rsize) {
+            uint64_t toread = rsize - offset;
+            if (toread > BUF_SIZE) toread = BUF_SIZE;
+
+            ssize_t rd = read(fd, sbuf, (size_t)toread);
+            if (rd < 8) break;
+
+            for (ssize_t j = 0; j + 7 < rd; j += 4) {
+                float x, y;
+                memcpy(&x, sbuf + j, 4);
+                memcpy(&y, sbuf + j + 4, 4);
+
+                if (fabsf(x - targetX) > tolerance || fabsf(y - targetY) > tolerance)
+                    continue;
+
+                uint64_t vaddr = vbase + offset + j;
+                uint64_t foff = fbase + offset + j;
+
+                /* Skip known render buffer region */
+                if (vaddr >= skip_min && vaddr <= skip_max)
+                    continue;
+
+                printf("MATCH %" PRIx64 " foff=%" PRIu64 " x=%.3f y=%.3f\n",
+                       vaddr, foff, x, y);
+                found++;
+
+                /* Dump context: read ctx_words*4 bytes before and after from file */
+                int ctx_bytes = ctx_words * 4;
+                int64_t ctx_start_foff = (int64_t)foff - ctx_bytes;
+                int ctx_total = ctx_bytes * 2 + 8; /* before + match + after */
+
+                /* Find which region this context falls in for vaddr mapping */
+                /* For simplicity, just compute vaddr relative offsets */
+                static char ctxbuf[16384]; /* max 4096 words = 16KB */
+                if (ctx_total > (int)sizeof(ctxbuf)) ctx_total = sizeof(ctxbuf);
+
+                if (ctx_start_foff < 0) ctx_start_foff = 0;
+                off64_t saved = lseek64(fd, 0, SEEK_CUR);
+                lseek64(fd, (off64_t)ctx_start_foff, SEEK_SET);
+                ssize_t ctx_rd = read(fd, ctxbuf, ctx_total);
+                lseek64(fd, saved, SEEK_SET);
+
+                if (ctx_rd > 0) {
+                    for (int w = 0; w + 3 < (int)ctx_rd; w += 4) {
+                        float fv;
+                        uint32_t uv;
+                        memcpy(&fv, ctxbuf + w, 4);
+                        memcpy(&uv, ctxbuf + w, 4);
+
+                        int64_t off_from_match = ((int64_t)ctx_start_foff + w) - (int64_t)foff;
+                        uint64_t wvaddr = vaddr + off_from_match;
+
+                        char notes[128] = "";
+                        if (off_from_match == 0) strcat(notes, "<<X ");
+                        if (off_from_match == 4) strcat(notes, "<<Y ");
+                        /* Check Ghidra predicted offsets relative to struct base */
+                        /* If match is at +0xD8, struct base = vaddr - 0xD8 */
+                        /* Check if there are plausible coords at expected offsets */
+                        if (!isnan(fv) && !isinf(fv) && fv > 100.0f && fv < 2500.0f)
+                            strcat(notes, "COORD ");
+                        if (uv == 0 || (uv >= 1 && uv <= 20))
+                            strcat(notes, "SMALL_INT ");
+                        if (uv == 5)
+                            strcat(notes, "STATUS5? ");
+                        if (uv >= 0xFFFFFF00)
+                            strcat(notes, "HIGH ");
+                        /* Check if it looks like a pointer to 64-bit heap */
+                        if ((uv & 0xFFFF0000) == 0x76380000 || (uv & 0xFFFF0000) == 0x76390000)
+                            strcat(notes, "PTR? ");
+
+                        printf("  CTX %+05d %" PRIx64 " f=%.3f u=%u (0x%08x) %s\n",
+                               (int)off_from_match, wvaddr, fv, uv, uv, notes);
+                    }
+                    printf("\n");
+                }
+
+                /* Only report first 20 matches to avoid flooding */
+                if (found >= 20) {
+                    fprintf(stderr, "Stopped at 20 matches\n");
+                    close(fd);
+                    return 0;
+                }
+            }
+
+            offset += rd;
+        }
+    }
+
+    close(fd);
+    fprintf(stderr, "Found %d matches for (%.3f, %.3f) tolerance=%.3f\n",
+            found, targetX, targetY, tolerance);
+    return 0;
+}
+
+/*
+ * Command: livefind - search LIVE process memory for a specific float pair
+ * Similar to snapfind but reads /proc/PID/mem directly.
+ * Does NOT freeze the process (caller should freeze with kill -STOP first).
+ */
+static int cmd_livefind(int pid, int nmerged, float targetX, float targetY,
+                        float tolerance, int ctx_words) {
+    char mem_path[64];
+    snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
+
+    int mem_fd = open(mem_path, O_RDONLY);
+    if (mem_fd < 0) {
+        fprintf(stderr, "Cannot open %s: %s\n", mem_path, strerror(errno));
+        return 1;
+    }
+
+    int found = 0;
+
+    for (int i = 0; i < nmerged; i++) {
+        uint64_t rstart = merged[i].start;
+        uint64_t rsize = merged[i].end - merged[i].start;
+
+        if (lseek64(mem_fd, (off64_t)rstart, SEEK_SET) == (off64_t)-1)
+            continue;
+
+        uint64_t offset = 0;
+        while (offset < rsize) {
+            uint64_t toread = rsize - offset;
+            if (toread > BUF_SIZE) toread = BUF_SIZE;
+
+            ssize_t rd = read(mem_fd, buf, (size_t)toread);
+            if (rd < 8) break;
+
+            for (ssize_t j = 0; j + 7 < rd; j += 4) {
+                float x, y;
+                memcpy(&x, buf + j, 4);
+                memcpy(&y, buf + j + 4, 4);
+
+                if (fabsf(x - targetX) > tolerance || fabsf(y - targetY) > tolerance)
+                    continue;
+
+                uint64_t vaddr = rstart + offset + j;
+
+                printf("MATCH %" PRIx64 " x=%.3f y=%.3f\n", vaddr, x, y);
+                found++;
+
+                /* Dump context around this address in live memory */
+                int ctx_bytes = ctx_words * 4;
+                int64_t ctx_start = (int64_t)vaddr - ctx_bytes;
+                int ctx_total = ctx_bytes * 2 + 8;
+                static char ctxbuf[16384];
+                if (ctx_total > (int)sizeof(ctxbuf)) ctx_total = sizeof(ctxbuf);
+                if (ctx_start < 0) ctx_start = 0;
+
+                off64_t saved = lseek64(mem_fd, 0, SEEK_CUR);
+                lseek64(mem_fd, (off64_t)ctx_start, SEEK_SET);
+                ssize_t ctx_rd = read(mem_fd, ctxbuf, ctx_total);
+                lseek64(mem_fd, saved, SEEK_SET);
+
+                if (ctx_rd > 0) {
+                    for (int w = 0; w + 3 < (int)ctx_rd; w += 4) {
+                        float fv;
+                        uint32_t uv;
+                        memcpy(&fv, ctxbuf + w, 4);
+                        memcpy(&uv, ctxbuf + w, 4);
+
+                        int64_t off_from_match = ((int64_t)ctx_start + w) - (int64_t)vaddr;
+                        uint64_t wvaddr = (uint64_t)((int64_t)vaddr + off_from_match);
+
+                        char notes[128] = "";
+                        if (off_from_match == 0) strcat(notes, "<<X ");
+                        if (off_from_match == 4) strcat(notes, "<<Y ");
+                        if (!isnan(fv) && !isinf(fv) && fv > 100.0f && fv < 2500.0f)
+                            strcat(notes, "COORD ");
+                        if (uv == 0 || (uv >= 1 && uv <= 20))
+                            strcat(notes, "SMALL_INT ");
+                        if (uv == 5)
+                            strcat(notes, "STATUS5? ");
+                        if (uv >= 0xFFFFFF00)
+                            strcat(notes, "HIGH ");
+
+                        printf("  CTX %+05d %" PRIx64 " f=%.3f u=%u (0x%08x) %s\n",
+                               (int)off_from_match, wvaddr, fv, uv, uv, notes);
+                    }
+                    printf("\n");
+                }
+
+                if (found >= 20) {
+                    fprintf(stderr, "Stopped at 20 matches\n");
+                    close(mem_fd);
+                    return 0;
+                }
+            }
+
+            offset += rd;
+        }
+    }
+
+    close(mem_fd);
+    fprintf(stderr, "Found %d matches for (%.3f, %.3f) tolerance=%.3f\n",
+            found, targetX, targetY, tolerance);
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 4) {
         fprintf(stderr, "Usage: memscan <PID> <mode> <command> [args...]\n");
@@ -600,6 +849,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  snap <outfile>\n");
         fprintf(stderr, "  newpairs <snap1> <snap2> <minX> <maxX> <minY> <maxY>\n");
         fprintf(stderr, "  bindiff <snap1> <snap2> <mode:all|new|gone|count> <minX> <maxX> <minY> <maxY>\n");
+        fprintf(stderr, "  snapfind <snapfile> <targetX> <targetY> <tolerance> <ctx_words>\n");
+        fprintf(stderr, "  livefind <targetX> <targetY> <tolerance> <ctx_words>\n");
         return 1;
     }
 
@@ -635,7 +886,6 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Usage: memscan <PID> <mode> newpairs <snap1> <snap2> <minX> <maxX> <minY> <maxY>\n");
             return 1;
         }
-        /* For newpairs we don't need to parse maps, we read from snapshot files */
         float minX = atof(argv[6]);
         float maxX = atof(argv[7]);
         float minY = atof(argv[8]);
@@ -652,6 +902,24 @@ int main(int argc, char *argv[]) {
         float minY = atof(argv[9]);
         float maxY = atof(argv[10]);
         return cmd_bindiff(argv[4], argv[5], argv[6], minX, maxX, minY, maxY);
+    }
+    else if (strcmp(cmd, "snapfind") == 0) {
+        if (argc < 9) {
+            fprintf(stderr, "Usage: memscan 0 0 snapfind <snapfile> <targetX> <targetY> <tolerance> <ctx_words>\n");
+            return 1;
+        }
+        return cmd_snapfind(argv[4], atof(argv[5]), atof(argv[6]),
+                            atof(argv[7]), atoi(argv[8]));
+    }
+    else if (strcmp(cmd, "livefind") == 0) {
+        if (argc < 8) {
+            fprintf(stderr, "Usage: memscan <PID> <mode> livefind <targetX> <targetY> <tolerance> <ctx_words>\n");
+            return 1;
+        }
+        int nmerged;
+        if (parse_maps(pid, mode, &nmerged) < 0) return 1;
+        return cmd_livefind(pid, nmerged, atof(argv[4]), atof(argv[5]),
+                            atof(argv[6]), atoi(argv[7]));
     }
     else {
         fprintf(stderr, "Unknown command: %s\n", cmd);
