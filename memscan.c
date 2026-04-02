@@ -846,6 +846,282 @@ static int cmd_livefind(int pid, int nmerged, float targetX, float targetY,
     return 0;
 }
 
+/*
+ * Helper: compute "coordinate density" around a position in a buffer.
+ * Returns fraction of surrounding dwords that look like valid game coordinates.
+ * High density (>0.5) = vertex buffer. Low density (<0.25) = struct field.
+ */
+static float coord_density(const char *data, ssize_t data_len, ssize_t pos,
+                           float coord_min, float coord_max, int radius_words) {
+    int count = 0;
+    int total = 0;
+    for (int w = -radius_words; w <= radius_words; w++) {
+        if (w == 0 || w == 1) continue; /* skip the match itself and next word */
+        ssize_t off = pos + w * 4;
+        if (off < 0 || off + 4 > data_len) continue;
+        float fv;
+        memcpy(&fv, data + off, 4);
+        total++;
+        if (!isnan(fv) && !isinf(fv) && fv >= coord_min && fv <= coord_max)
+            count++;
+    }
+    return total > 0 ? (float)count / total : 0.0f;
+}
+
+/*
+ * Command: structscan - search snapshot for isolated float coordinates.
+ * Filters out dense vertex buffer regions.
+ *
+ * Usage: memscan 0 0 structscan <snapfile> <target> <tolerance> <max_density> <ctx_words>
+ *   target: float value to search for (e.g. 869.33)
+ *   tolerance: max diff for match (e.g. 2.0)
+ *   max_density: max fraction of surrounding values that are coords (e.g. 0.25)
+ *   ctx_words: context words to dump around each match
+ */
+static int cmd_structscan(const char *snapfile, float target, float tolerance,
+                          float max_density, int ctx_words) {
+    char idxpath[512];
+    snprintf(idxpath, sizeof(idxpath), "%s.idx", snapfile);
+
+    struct idxentry { uint64_t vaddr; uint64_t size; uint64_t foff; };
+    static struct idxentry ix[MAX_REGIONS];
+    int nix = 0;
+    FILE *f = fopen(idxpath, "r");
+    if (!f) { fprintf(stderr, "Cannot open %s\n", idxpath); return 1; }
+    while (nix < MAX_REGIONS && fscanf(f, "%" SCNx64 " %" SCNu64 " %" SCNu64,
+           &ix[nix].vaddr, &ix[nix].size, &ix[nix].foff) == 3) nix++;
+    fclose(f);
+
+    int fd = open(snapfile, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "Cannot open %s\n", snapfile); return 1; }
+
+    int found = 0;
+    /* Use larger buffer for density checks */
+    #define SCAN_BUF (2 * 1024 * 1024)
+    static char sbuf[SCAN_BUF];
+    int density_radius = 32; /* check 32 dwords before/after = 256 bytes */
+
+    for (int r = 0; r < nix; r++) {
+        uint64_t vbase = ix[r].vaddr;
+        uint64_t rsize = ix[r].size;
+        uint64_t fbase = ix[r].foff;
+
+        if (lseek64(fd, (off64_t)fbase, SEEK_SET) == (off64_t)-1)
+            continue;
+
+        uint64_t offset = 0;
+        while (offset < rsize) {
+            uint64_t toread = rsize - offset;
+            if (toread > SCAN_BUF) toread = SCAN_BUF;
+
+            ssize_t rd = read(fd, sbuf, (size_t)toread);
+            if (rd < 4) break;
+
+            for (ssize_t j = 0; j + 3 < rd; j += 4) {
+                float val;
+                memcpy(&val, sbuf + j, 4);
+
+                if (isnan(val) || isinf(val)) continue;
+                if (fabsf(val - target) > tolerance) continue;
+
+                /* Check density */
+                float density = coord_density(sbuf, rd, j, 100.0f, 2500.0f, density_radius);
+                if (density > max_density) continue;
+
+                uint64_t vaddr = vbase + offset + j;
+                uint64_t foff = fbase + offset + j;
+
+                printf("STRUCT %" PRIx64 " foff=%" PRIu64 " val=%.3f density=%.2f\n",
+                       vaddr, foff, val, density);
+                found++;
+
+                /* Dump context */
+                int ctx_bytes = ctx_words * 4;
+                int64_t ctx_start = (int64_t)j - ctx_bytes;
+                int ctx_total = ctx_bytes * 2 + 4;
+
+                if (ctx_start < 0) ctx_start = 0;
+                if (ctx_start + ctx_total > rd) ctx_total = rd - ctx_start;
+
+                for (int w = 0; w + 3 < ctx_total; w += 4) {
+                    float fv;
+                    uint32_t uv;
+                    int64_t buf_off = ctx_start + w;
+                    memcpy(&fv, sbuf + buf_off, 4);
+                    memcpy(&uv, sbuf + buf_off, 4);
+
+                    int64_t off_from_match = buf_off - j;
+                    uint64_t wvaddr = vaddr + off_from_match;
+
+                    char notes[128] = "";
+                    if (off_from_match == 0) strcat(notes, "<<MATCH ");
+                    if (!isnan(fv) && !isinf(fv) && fv >= 100.0f && fv <= 2500.0f)
+                        strcat(notes, "COORD ");
+                    if (uv == 0)
+                        strcat(notes, "ZERO ");
+                    else if (uv >= 1 && uv <= 20)
+                        strcat(notes, "SMALL ");
+                    if (uv == 5)
+                        strcat(notes, "ST5? ");
+                    /* Pointer-like values (64-bit heap) */
+                    if (uv >= 0x76300000 && uv <= 0x76400000)
+                        strcat(notes, "PTR64? ");
+
+                    printf("  CTX %+05d %" PRIx64 " f=%.4f u=%u (0x%08x) %s\n",
+                           (int)off_from_match, wvaddr, fv, uv, uv, notes);
+                }
+                printf("\n");
+
+                if (found >= 50) {
+                    fprintf(stderr, "Stopped at 50 matches\n");
+                    close(fd);
+                    return 0;
+                }
+            }
+
+            offset += rd;
+        }
+    }
+
+    close(fd);
+    fprintf(stderr, "Found %d struct-like matches for %.3f (tol=%.3f, maxdensity=%.2f)\n",
+            found, target, tolerance, max_density);
+    return 0;
+}
+
+/*
+ * Command: structdiff - compare two snapshots, only report CHANGED floats
+ * at struct-like locations (low coordinate density).
+ * Filters out vertex buffer noise.
+ *
+ * Usage: memscan 0 0 structdiff <snap1> <snap2> <coord_min> <coord_max> <max_density>
+ *   Reports float values that changed between snapshots AND are in [coord_min, coord_max]
+ *   AND have low coordinate density around them (struct-like, not vertex buffer).
+ */
+static int cmd_structdiff(const char *snap1, const char *snap2,
+                          float coord_min, float coord_max, float max_density) {
+    char idx1_path[512], idx2_path[512];
+    snprintf(idx1_path, sizeof(idx1_path), "%s.idx", snap1);
+    snprintf(idx2_path, sizeof(idx2_path), "%s.idx", snap2);
+
+    struct idxentry { uint64_t vaddr; uint64_t size; uint64_t foff; };
+    static struct idxentry ix1[MAX_REGIONS], ix2[MAX_REGIONS];
+    int n1 = 0, n2 = 0;
+
+    FILE *f;
+    f = fopen(idx1_path, "r");
+    if (!f) { fprintf(stderr, "Cannot open %s\n", idx1_path); return 1; }
+    while (n1 < MAX_REGIONS && fscanf(f, "%" SCNx64 " %" SCNu64 " %" SCNu64,
+           &ix1[n1].vaddr, &ix1[n1].size, &ix1[n1].foff) == 3) n1++;
+    fclose(f);
+
+    f = fopen(idx2_path, "r");
+    if (!f) { fprintf(stderr, "Cannot open %s\n", idx2_path); return 1; }
+    while (n2 < MAX_REGIONS && fscanf(f, "%" SCNx64 " %" SCNu64 " %" SCNu64,
+           &ix2[n2].vaddr, &ix2[n2].size, &ix2[n2].foff) == 3) n2++;
+    fclose(f);
+
+    int fd1 = open(snap1, O_RDONLY);
+    int fd2 = open(snap2, O_RDONLY);
+    if (fd1 < 0 || fd2 < 0) {
+        fprintf(stderr, "Cannot open snapshot files\n");
+        if (fd1 >= 0) close(fd1);
+        if (fd2 >= 0) close(fd2);
+        return 1;
+    }
+
+    int density_radius = 32;
+    static char b1[SCAN_BUF], b2[SCAN_BUF];
+    int found = 0;
+    uint64_t total_compared = 0;
+
+    for (int r2 = 0; r2 < n2; r2++) {
+        int r1 = -1;
+        for (int k = 0; k < n1; k++) {
+            if (ix1[k].vaddr == ix2[r2].vaddr) { r1 = k; break; }
+        }
+        if (r1 < 0) continue;
+
+        uint64_t cmp_size = ix1[r1].size < ix2[r2].size ? ix1[r1].size : ix2[r2].size;
+        uint64_t vbase = ix2[r2].vaddr;
+
+        lseek64(fd1, (off64_t)ix1[r1].foff, SEEK_SET);
+        lseek64(fd2, (off64_t)ix2[r2].foff, SEEK_SET);
+
+        uint64_t offset = 0;
+        while (offset < cmp_size) {
+            uint64_t toread = cmp_size - offset;
+            if (toread > SCAN_BUF) toread = SCAN_BUF;
+
+            ssize_t rd1 = read(fd1, b1, (size_t)toread);
+            ssize_t rd2 = read(fd2, b2, (size_t)toread);
+            ssize_t rd = (rd1 < rd2) ? rd1 : rd2;
+            if (rd < 4) break;
+
+            for (ssize_t j = 0; j + 3 < rd; j += 4) {
+                /* Quick skip: if bytes identical, skip */
+                if (*(uint32_t*)(b1 + j) == *(uint32_t*)(b2 + j)) continue;
+
+                float v1, v2;
+                memcpy(&v1, b1 + j, 4);
+                memcpy(&v2, b2 + j, 4);
+
+                /* At least one must be in coordinate range */
+                int v1_coord = !isnan(v1) && !isinf(v1) && v1 >= coord_min && v1 <= coord_max;
+                int v2_coord = !isnan(v2) && !isinf(v2) && v2 >= coord_min && v2 <= coord_max;
+                if (!v1_coord && !v2_coord) continue;
+
+                /* Check density in snap2 to filter vertex buffers */
+                float density = coord_density(b2, rd, j, coord_min, coord_max, density_radius);
+                if (density > max_density) continue;
+
+                uint64_t vaddr = vbase + offset + j;
+                float delta = v2 - v1;
+
+                printf("SDIFF %" PRIx64 " %.3f -> %.3f (d=%.3f) dens=%.2f\n",
+                       vaddr, v1, v2, delta, density);
+                found++;
+
+                /* Brief context: 8 words before/after */
+                for (int w = -8; w <= 9; w++) {
+                    ssize_t off = j + w * 4;
+                    if (off < 0 || off + 4 > rd) continue;
+                    float fv1, fv2;
+                    uint32_t uv2;
+                    memcpy(&fv1, b1 + off, 4);
+                    memcpy(&fv2, b2 + off, 4);
+                    memcpy(&uv2, b2 + off, 4);
+
+                    char mark = ' ';
+                    if (w == 0) mark = '>';
+                    else if (*(uint32_t*)(b1 + off) != *(uint32_t*)(b2 + off)) mark = '*';
+
+                    printf("  %c %+03d f1=%.3f f2=%.3f u2=0x%08x\n",
+                           mark, w * 4, fv1, fv2, uv2);
+                }
+                printf("\n");
+
+                if (found >= 100) {
+                    fprintf(stderr, "Stopped at 100 matches. Compared %" PRIu64 "MB\n",
+                            total_compared / (1024*1024));
+                    close(fd1); close(fd2);
+                    return 0;
+                }
+            }
+
+            offset += rd;
+            total_compared += rd;
+        }
+    }
+
+    close(fd1);
+    close(fd2);
+
+    fprintf(stderr, "Found %d struct-like changes (%.0f-%.0f, maxdens=%.2f). Compared %" PRIu64 "MB\n",
+            found, coord_min, coord_max, max_density, total_compared / (1024*1024));
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 4) {
         fprintf(stderr, "Usage: memscan <PID> <mode> <command> [args...]\n");
@@ -856,6 +1132,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  bindiff <snap1> <snap2> <mode:all|new|gone|count> <minX> <maxX> <minY> <maxY>\n");
         fprintf(stderr, "  snapfind <snapfile> <targetX> <targetY> <tolerance> <ctx_words>\n");
         fprintf(stderr, "  livefind <targetX> <targetY> <tolerance> <ctx_words>\n");
+        fprintf(stderr, "  structscan <snapfile> <target> <tolerance> <max_density> <ctx_words>\n");
+        fprintf(stderr, "  structdiff <snap1> <snap2> <coord_min> <coord_max> <max_density>\n");
         return 1;
     }
 
@@ -925,6 +1203,22 @@ int main(int argc, char *argv[]) {
         if (parse_maps(pid, mode, &nmerged) < 0) return 1;
         return cmd_livefind(pid, nmerged, atof(argv[4]), atof(argv[5]),
                             atof(argv[6]), atoi(argv[7]));
+    }
+    else if (strcmp(cmd, "structscan") == 0) {
+        if (argc < 9) {
+            fprintf(stderr, "Usage: memscan 0 0 structscan <snapfile> <target> <tolerance> <max_density> <ctx_words>\n");
+            return 1;
+        }
+        return cmd_structscan(argv[4], atof(argv[5]), atof(argv[6]),
+                              atof(argv[7]), atoi(argv[8]));
+    }
+    else if (strcmp(cmd, "structdiff") == 0) {
+        if (argc < 9) {
+            fprintf(stderr, "Usage: memscan 0 0 structdiff <snap1> <snap2> <coord_min> <coord_max> <max_density>\n");
+            return 1;
+        }
+        return cmd_structdiff(argv[4], argv[5], atof(argv[6]),
+                              atof(argv[7]), atof(argv[8]));
     }
     else {
         fprintf(stderr, "Unknown command: %s\n", cmd);
